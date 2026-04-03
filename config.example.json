@@ -1,0 +1,7 @@
+{
+  "api_url": "https://api.deepseek.com/v1/chat/completions",
+  "api_key": "your-api-key-here",
+  "api_model": "deepseek-chat",
+  "prompt_word": "你是一个专业的中英翻译助手。请将以下英文单词翻译成中文，并给出简要解释和常见用法。单词：{word}",
+  "prompt_item": "你是一个专业的中英翻译助手。请将以下英文内容翻译成流畅的中文，保留原文的格式和结构。内容：\n\n{text}"
+}

@@ -1,0 +1,5 @@
+# API and cache files - never commit these
+config.json
+cache.json
+*.pyc
+__pycache__/
