@@ -301,7 +301,7 @@ def fetch_article_text(url):
         doc = Document(r.text)
         soup = BeautifulSoup(doc.summary(), 'html.parser')
 
-        for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'img', 'figure', 'figcaption']):
+        for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'img', 'figure', 'figcaption', 'iframe', 'video', 'audio']):
             tag.decompose()
 
         lines = []
@@ -319,20 +319,22 @@ def fetch_article_text(url):
                 for c in node.children:
                     walk(c)
                 lines.append('')
-            elif tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
-                lvl = int(tag[1])
+            elif tag == 'h1':
                 lines.append('')
-                lines.append(f"{'#' * lvl} {node.get_text(strip=True)}")
+                lines.append(f"# {node.get_text(strip=True)}")
+                lines.append('')
+            elif tag == 'h2':
+                lines.append('')
+                lines.append(f"## {node.get_text(strip=True)}")
+                lines.append('')
+            elif tag in ('h3', 'h4', 'h5', 'h6'):
+                lines.append('')
+                lines.append(node.get_text(strip=True))
                 lines.append('')
             elif tag == 'blockquote':
                 lines.append('')
                 for c in node.children:
-                    if isinstance(c, NavigableString) and not c.strip():
-                        continue
-                    txt = c.get_text(strip=True) if isinstance(c, Tag) else c.strip()
-                    for l in txt.split('\n'):
-                        if l.strip():
-                            lines.append(f"> {l.strip()}")
+                    walk(c)
                 lines.append('')
             elif tag == 'ul':
                 lines.append('')
@@ -353,11 +355,9 @@ def fetch_article_text(url):
                     lines.append(txt)
             elif tag in ('br', 'hr'):
                 lines.append('')
-            elif tag in ('div', 'section', 'article', 'main', 'body'):
-                lines.append('')
+            elif tag in ('div', 'section', 'article', 'main', 'body', 'blockquote'):
                 for c in node.children:
                     walk(c)
-                lines.append('')
             else:
                 for c in node.children:
                     walk(c)
@@ -692,11 +692,7 @@ class HNViewer:
                 idx += 1
                 continue
 
-            if line.startswith('###'):
-                self.stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
-                self.stdscr.addnstr(ry, 2, line, content_w)
-                self.stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
-            elif line.startswith('##'):
+            if line.startswith('##'):
                 self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
                 self.stdscr.addnstr(ry, 2, line, content_w)
                 self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
@@ -704,10 +700,6 @@ class HNViewer:
                 self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE)
                 self.stdscr.addnstr(ry, 2, line, content_w)
                 self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE)
-            elif line.startswith('> '):
-                self.stdscr.attron(curses.color_pair(3))
-                self.stdscr.addnstr(ry, 2, line, content_w)
-                self.stdscr.attroff(curses.color_pair(3))
             elif line.startswith('• ') or (len(line) > 2 and line[0].isdigit() and line[1] == '.'):
                 self.stdscr.attron(curses.color_pair(8))
                 self.stdscr.addnstr(ry, 2, line, content_w)
