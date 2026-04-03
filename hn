@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Hacker News Terminal Viewer - uses Algolia API (works from China)"""
 
+import os
+os.environ.setdefault('ESCDELAY', '25')
+
 import curses
 import json
 import requests
@@ -398,7 +401,7 @@ class HNViewer:
         self.search_query = ""
         self.filtered_stories: List[Story] = []
         curses.curs_set(0)
-        self.stdscr.timeout(200)
+        self.stdscr.timeout(10)
         self.stdscr.keypad(True)
         curses.start_color()
         curses.use_default_colors()
@@ -520,14 +523,39 @@ class HNViewer:
                 if not line.strip():
                     wrapped.append('')
                 elif line.startswith('#') or line.startswith('> ') or line.startswith('• '):
-                    # Semantic lines: don't wrap, let addnstr truncate
                     wrapped.append(line)
                 else:
                     wrapped.extend(wrap_by_width(line, content_w))
             self.article_text = wrapped
-            self.view_state = ViewState.ARTICLE
+
+            # Aggregate paragraphs: consecutive non-empty lines form one paragraph
+            self.article_paragraphs = []
+            para_start = None
+            for i, line in enumerate(wrapped):
+                if line.strip():
+                    if para_start is None:
+                        para_start = i
+                else:
+                    if para_start is not None:
+                        full_text = '\n'.join(wrapped[para_start:i])
+                        self.article_paragraphs.append({
+                            'start': para_start,
+                            'end': i - 1,
+                            'text': full_text,
+                        })
+                        para_start = None
+            if para_start is not None:
+                full_text = '\n'.join(wrapped[para_start:])
+                self.article_paragraphs.append({
+                    'start': para_start,
+                    'end': len(wrapped) - 1,
+                    'text': full_text,
+                })
+
             self.article_scroll = 0
-            self.status = f"Article: {s.title[:60]} | j/k: scroll | g/G: top/bottom | esc: back | q: quit"
+            self.article_selected = 0
+            self.view_state = ViewState.ARTICLE
+            self.status = f"Article: {s.title[:60]} | j/k: paragraph | T: translate | g/G: top/bottom | esc: back | q: quit"
         else:
             self.status = "Failed to fetch article content. Press 'c' to view comments instead."
         self.loading = False
@@ -680,19 +708,43 @@ class HNViewer:
         self.stdscr.addnstr(0, 0, title.ljust(w), w - 1)
         self.stdscr.attroff(curses.color_pair(6) | curses.A_BOLD)
 
-        # Render article with structured formatting
         content_w = w - 4
-        visible = h - 3
+        visible_rows = h - 3
+
+        # Ensure selected paragraph is visible
+        if self.article_paragraphs:
+            sel = self.article_paragraphs[self.article_selected]
+            # Check if selected paragraph is fully or partially visible
+            sel_in_view = False
+            for i in range(visible_rows):
+                row_idx = self.article_scroll + i
+                if sel['start'] <= row_idx <= sel['end']:
+                    sel_in_view = True
+                    break
+            if not sel_in_view:
+                self.article_scroll = sel['start']
+
+        # Render all visible lines with paragraph-level highlighting
         ry = 1
         idx = self.article_scroll
         while ry < h - 1 and idx < len(self.article_text):
             line = self.article_text[idx]
+            is_selected = False
+            if self.article_paragraphs:
+                sel = self.article_paragraphs[self.article_selected]
+                is_selected = sel['start'] <= idx <= sel['end']
+
             if not line.strip():
                 ry += 1
                 idx += 1
                 continue
 
-            if line.startswith('##'):
+            if is_selected:
+                # Selected paragraph: highlight with color_pair(7)
+                self.stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
+                self.stdscr.addnstr(ry, 2, line, content_w)
+                self.stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
+            elif line.startswith('##'):
                 self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
                 self.stdscr.addnstr(ry, 2, line, content_w)
                 self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
@@ -1045,12 +1097,9 @@ class HNViewer:
 
             if in_translation:
                 self.draw_translation_popup()
-                if self.translating:
-                    time.sleep(0.15)
 
             if in_confirm:
                 self.draw_confirm_exit()
-                time.sleep(0.15)
 
             key = self.stdscr.getch()
 
@@ -1086,17 +1135,23 @@ class HNViewer:
                 if key == 27 or key == ord('b'):
                     self.view_state = ViewState.LIST
                     self.article_text = []
+                    self.article_paragraphs = []
                     self.status = f"Loaded {len(self.stories)} stories | j/k: nav | o: detail | c: comments | a: article | T: translate | q: quit"
                 elif key == ord('j') or key == curses.KEY_DOWN:
-                    if self.article_scroll < len(self.article_text) - 1:
-                        self.article_scroll += 1
+                    if self.article_selected < len(self.article_paragraphs) - 1:
+                        self.article_selected += 1
                 elif key == ord('k') or key == curses.KEY_UP:
-                    if self.article_scroll > 0:
-                        self.article_scroll -= 1
+                    if self.article_selected > 0:
+                        self.article_selected -= 1
                 elif key == ord('g'):
-                    self.article_scroll = 0
+                    self.article_selected = 0
                 elif key == ord('G'):
-                    self.article_scroll = max(0, len(self.article_text) - self.stdscr.getmaxyx()[0] + 4)
+                    self.article_selected = max(0, len(self.article_paragraphs) - 1)
+                elif key == ord('t') or key == ord('T'):
+                    if self.article_paragraphs:
+                        p = self.article_paragraphs[self.article_selected]
+                        self.start_translation(p['text'])
+                        in_translation = True
                 elif key == ord('q') or key == ord('Q'):
                     break
             elif self.search_mode:
