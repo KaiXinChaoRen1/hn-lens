@@ -352,6 +352,210 @@ def is_structured_article_line(line):
         or ' | ' in line
     )
 
+def split_article_blocks(lines):
+    """Split article lines into semantic blocks separated by empty lines."""
+    blocks = []
+    current = []
+    for line in lines:
+        if line.strip():
+            current.append(line.rstrip())
+        elif current:
+            blocks.append(current)
+            current = []
+    if current:
+        blocks.append(current)
+    return blocks
+
+def classify_article_block(block):
+    """Classify a block for rendering and cleanup."""
+    if not block:
+        return "empty"
+    first = block[0]
+    if first.startswith('#'):
+        return "heading"
+    if all(line.startswith('> ') for line in block):
+        return "quote"
+    if all(line.startswith('    ') for line in block):
+        return "code"
+    if all(line.startswith('• ') or re.match(r'^\d+\.\s', line) for line in block):
+        return "list"
+    if sum(' | ' in line for line in block) >= max(1, len(block) // 2):
+        return "table"
+    return "paragraph"
+
+def is_noise_article_block(block, index):
+    """Heuristic filter for metadata and article-adjacent noise."""
+    text = normalize_whitespace(" ".join(block))
+    lower = text.lower()
+    if not text:
+        return True
+
+    short_block = len(text) <= 140 and len(block) <= 3
+    top_metadata_patterns = (
+        r'^\d+\s+(seconds?|minutes?|hours?|days?|weeks?)\s+ago$',
+        r'^(updated\s+)?\d+\s+(seconds?|minutes?|hours?|days?|weeks?)\s+ago$',
+        r'^(by\s+)?[A-Z][A-Za-z.\-\' ]{2,40}$',
+    )
+    if index <= 2 and short_block:
+        if any(re.match(pattern, text, re.IGNORECASE) for pattern in top_metadata_patterns):
+            return True
+
+    noise_keywords = (
+        'read more', 'related', 'recommended', 'share this', 'share on',
+        'follow us', 'newsletter', 'sign up', 'subscribe', 'advertisement',
+        'cookie', 'all rights reserved', 'copyright', 'photo credit',
+        'image source', 'watch:', 'listen:', 'live updates'
+    )
+    if short_block and any(keyword in lower for keyword in noise_keywords):
+        return True
+
+    if lower.startswith('source:') or lower.startswith('image source:'):
+        return True
+
+    return False
+
+def wrap_article_block(block, content_w):
+    """Wrap a semantic article block into display lines."""
+    block_type = classify_article_block(block)
+    wrapped = []
+
+    if block_type == "heading":
+        for line in block:
+            wrapped.extend(wrap_by_width(line, content_w))
+        return wrapped
+
+    if block_type == "quote":
+        quote_w = max(10, content_w - 2)
+        for line in block:
+            text = line[2:].strip()
+            for wrapped_line in wrap_by_width(text, quote_w):
+                wrapped.append(f"> {wrapped_line}")
+        return wrapped
+
+    if block_type == "code":
+        for line in block:
+            wrapped.append(line[:content_w])
+        return wrapped
+
+    if block_type == "list":
+        list_w = max(10, content_w - 2)
+        for line in block:
+            marker = "• "
+            text = line
+            match = re.match(r'^(\d+\.\s)(.*)$', line)
+            if line.startswith('• '):
+                marker = '• '
+                text = line[2:].strip()
+            elif match:
+                marker = match.group(1)
+                text = match.group(2).strip()
+            wrapped_lines = wrap_by_width(text, max(10, list_w - len(marker)))
+            if wrapped_lines:
+                wrapped.append(f"{marker}{wrapped_lines[0]}")
+                indent = " " * len(marker)
+                for continuation in wrapped_lines[1:]:
+                    wrapped.append(f"{indent}{continuation}")
+        return wrapped
+
+    if block_type == "table":
+        table_w = max(10, content_w - 2)
+        for line in block:
+            for wrapped_line in wrap_by_width(line, table_w):
+                wrapped.append(f"│ {wrapped_line}")
+        return wrapped
+
+    for line in block:
+        wrapped.extend(wrap_by_width(line, content_w))
+    return wrapped
+
+def prepare_article_lines(text, content_w, filter_noise=True):
+    """Convert extracted article text into cleaner display lines."""
+    raw_lines = text.split('\n')
+    normalized = []
+    for line in raw_lines:
+        stripped = line.rstrip()
+        if stripped:
+            normalized.append(stripped)
+        else:
+            normalized.append("")
+
+    blocks = split_article_blocks(normalized)
+    kept_blocks = []
+    for idx, block in enumerate(blocks):
+        if filter_noise and is_noise_article_block(block, idx):
+            continue
+        kept_blocks.append(block)
+
+    wrapped = []
+    for idx, block in enumerate(kept_blocks):
+        wrapped.extend(wrap_article_block(block, content_w))
+        if idx != len(kept_blocks) - 1:
+            wrapped.append("")
+
+    return wrapped
+
+def label_article_paragraphs(paragraphs):
+    """Attach stable paragraph ids like [P1], [P2] to article paragraphs."""
+    labeled = []
+    for idx, para in enumerate(paragraphs, 1):
+        para_copy = dict(para)
+        para_copy["pid"] = f"P{idx}"
+        labeled.append(para_copy)
+    return labeled
+
+def build_article_display_lines(paragraphs):
+    """Render labeled article paragraphs into display lines."""
+    lines = []
+    rendered_paragraphs = []
+    for para in paragraphs:
+        start = len(lines)
+        lines.append(f"[{para['pid']}]")
+        lines.extend(para["text"].split("\n"))
+        end = len(lines) - 1
+        rendered = dict(para)
+        rendered["start"] = start
+        rendered["end"] = end
+        rendered_paragraphs.append(rendered)
+        lines.append("")
+    if lines and not lines[-1].strip():
+        lines.pop()
+    return lines, rendered_paragraphs
+
+def build_article_translation_prompt(paragraphs):
+    """Build a paragraph-numbered translation prompt for the whole article."""
+    blocks = []
+    for para in paragraphs:
+        blocks.append(f"[{para['pid']}]\n{para['text']}")
+    payload = "\n\n".join(blocks)
+    return (
+        "请把下面的英文文章翻译成中文。\n"
+        "要求：\n"
+        "1. 严格保留每个段落编号，例如 [P1] [P2] [P3]\n"
+        "2. 按原顺序输出，不要合并段落\n"
+        "3. 每个编号下面只写对应段落的中文翻译\n"
+        "4. 不要补充说明，不要输出编号之外的标题\n\n"
+        f"{payload}"
+    )
+
+def parse_labeled_article_translation(text):
+    """Parse a translation response that uses [P1]-style paragraph ids."""
+    parsed = {}
+    current_pid = None
+    current_lines = []
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        match = re.match(r'^\[(P\d+)\]\s*$', line.strip())
+        if match:
+            if current_pid:
+                parsed[current_pid] = "\n".join(current_lines).strip()
+            current_pid = match.group(1)
+            current_lines = []
+        elif current_pid is not None:
+            current_lines.append(line)
+    if current_pid:
+        parsed[current_pid] = "\n".join(current_lines).strip()
+    return parsed
+
 def fetch_article_text(url):
     """Fetch article content and convert HTML to structured plain text"""
     if not url:
@@ -609,6 +813,11 @@ class HNViewer:
         self.comment_scroll = 0
         self.comment_selected = 0
         self.article_text: List[str] = []
+        self.article_source_text = ""
+        self.article_translation_text = ""
+        self.article_translation_map = {}
+        self.article_translation_loading = False
+        self.article_translation_scroll = 0
         self.article_scroll = 0
         self.search_query = ""
         self.filtered_stories: List[Story] = []
@@ -631,7 +840,7 @@ class HNViewer:
                 curses.init_pair(4, curses.COLOR_RED, -1)
                 curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
                 curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_WHITE)
-                curses.init_pair(7, curses.COLOR_MAGENTA, curses.COLOR_BLUE)
+                curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_BLUE)
                 curses.init_pair(8, curses.COLOR_WHITE, -1)
                 curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_BLACK)
                 curses.init_pair(10, curses.COLOR_CYAN, -1)
@@ -757,6 +966,11 @@ class HNViewer:
         self.all_comments = []
         self.comments = []
         self.article_text = []
+        self.article_source_text = ""
+        self.article_translation_text = ""
+        self.article_translation_map = {}
+        self.article_translation_loading = False
+        self.article_translation_scroll = 0
         if self.search_mode:
             self.filter_stories()
             self.status = f"Search: {len(self.filtered_stories)} results | esc: exit search | j/k: nav"
@@ -941,19 +1155,11 @@ class HNViewer:
         if text:
             _, w = self.stdscr.getmaxyx()
             content_w = w - 4
-            raw_lines = text.split('\n')
-            wrapped = []
-            for line in raw_lines:
-                if not line.strip():
-                    wrapped.append('')
-                elif is_structured_article_line(line):
-                    wrapped.append(line)
-                else:
-                    wrapped.extend(wrap_by_width(line, content_w))
-            self.article_text = wrapped
+            self.article_source_text = text
+            wrapped = prepare_article_lines(text, content_w)
 
             # Aggregate paragraphs: consecutive non-empty lines form one paragraph
-            self.article_paragraphs = []
+            article_paragraphs = []
             para_start = None
             for i, line in enumerate(wrapped):
                 if line.strip():
@@ -962,27 +1168,64 @@ class HNViewer:
                 else:
                     if para_start is not None:
                         full_text = '\n'.join(wrapped[para_start:i])
-                        self.article_paragraphs.append({
-                            'start': para_start,
-                            'end': i - 1,
+                        article_paragraphs.append({
                             'text': full_text,
                         })
                         para_start = None
             if para_start is not None:
                 full_text = '\n'.join(wrapped[para_start:])
-                self.article_paragraphs.append({
-                    'start': para_start,
-                    'end': len(wrapped) - 1,
+                article_paragraphs.append({
                     'text': full_text,
                 })
 
+            article_paragraphs = label_article_paragraphs(article_paragraphs)
+            self.article_text, self.article_paragraphs = build_article_display_lines(article_paragraphs)
+
             self.article_scroll = 0
             self.article_selected = 0
+            self.article_translation_scroll = 0
+            self.start_article_translation(self.article_paragraphs)
             self.view_state = ViewState.ARTICLE
             self.status = f"Article: {s.title[:60]} | j/k: paragraph | T: translate | g/G: top/bottom | esc: back | q: quit"
         else:
             self.status = "Failed to fetch article content. Press 'c' to view comments instead."
         self.loading = False
+
+    def start_article_translation(self, paragraphs):
+        """Start async numbered full-article translation for the article pane."""
+        clean = build_article_translation_prompt(paragraphs).strip()
+        self.article_translation_text = ""
+        self.article_translation_map = {}
+        self.article_translation_loading = False
+        if not clean:
+            return
+        if not self.cfg.get("key") or self.cfg["key"] == "your-api-key-here":
+            self.article_translation_text = "[错误] 请先在 ~/.hn/config.json 中配置 api_key"
+            return
+
+        cache_key = get_cache_key(f"article-v2:{clean}")
+        cached_result = self.cache.get(cache_key)
+        if cached_result:
+            if is_error_text(cached_result):
+                del self.cache[cache_key]
+                save_cache(self.cache)
+            else:
+                self.article_translation_text = cached_result
+                self.article_translation_map = parse_labeled_article_translation(cached_result)
+                return
+
+        self.article_translation_loading = True
+
+        def _translate_article():
+            result = call_llm(clean, self.cfg)
+            if not is_error_text(result):
+                self.cache[cache_key] = result
+                save_cache(self.cache)
+            self.article_translation_text = result
+            self.article_translation_map = parse_labeled_article_translation(result)
+            self.article_translation_loading = False
+
+        threading.Thread(target=_translate_article, daemon=True).start()
 
     def draw_main(self):
         self.stdscr.erase()
@@ -1133,14 +1376,23 @@ class HNViewer:
         self.stdscr.attroff(curses.color_pair(6) | curses.A_BOLD)
 
         content_w = w - 4
-        visible_rows = h - 3
+        body_rows = max(4, h - 2)
+        article_rows = max(5, (body_rows * 3) // 5)
+        trans_rows = body_rows - article_rows - 1
+        if trans_rows < 4:
+            trans_rows = 4
+            article_rows = max(4, body_rows - trans_rows - 1)
+        article_end_y = article_rows
+        sep_y = article_end_y + 1
+        trans_start_y = sep_y + 1
+        article_visible_rows = article_rows
 
         # Ensure selected paragraph is visible
         if self.article_paragraphs:
             sel = self.article_paragraphs[self.article_selected]
             # Check if selected paragraph is fully or partially visible
             sel_in_view = False
-            for i in range(visible_rows):
+            for i in range(article_visible_rows):
                 row_idx = self.article_scroll + i
                 if sel['start'] <= row_idx <= sel['end']:
                     sel_in_view = True
@@ -1148,10 +1400,10 @@ class HNViewer:
             if not sel_in_view:
                 self.article_scroll = sel['start']
 
-        # Render all visible lines with paragraph-level highlighting
+        # Render article section
         ry = 1
         idx = self.article_scroll
-        while ry < h - 1 and idx < len(self.article_text):
+        while ry <= article_end_y and idx < len(self.article_text):
             line = self.article_text[idx]
             is_selected = False
             if self.article_paragraphs:
@@ -1176,15 +1428,110 @@ class HNViewer:
                 self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE)
                 self.stdscr.addnstr(ry, 2, line, content_w)
                 self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE)
-            elif line.startswith('• ') or (len(line) > 2 and line[0].isdigit() and line[1] == '.'):
+            elif line.startswith('> '):
+                self.stdscr.attron(curses.color_pair(10))
+                self.stdscr.addnstr(ry, 2, line, content_w)
+                self.stdscr.attroff(curses.color_pair(10))
+            elif line.startswith('    '):
+                self.stdscr.attron(curses.color_pair(9))
+                self.stdscr.addnstr(ry, 2, line, content_w)
+                self.stdscr.attroff(curses.color_pair(9))
+            elif line.startswith('│ '):
                 self.stdscr.attron(curses.color_pair(8))
                 self.stdscr.addnstr(ry, 2, line, content_w)
                 self.stdscr.attroff(curses.color_pair(8))
+            elif line.startswith('• ') or (len(line) > 2 and line[0].isdigit() and line[1] == '.'):
+                self.stdscr.attron(curses.color_pair(2))
+                self.stdscr.addnstr(ry, 2, line, content_w)
+                self.stdscr.attroff(curses.color_pair(2))
             else:
                 self.stdscr.addnstr(ry, 2, line, content_w)
 
             ry += 1
             idx += 1
+
+        # Divider and translation label
+        divider_label = " Full Translation "
+        left = max(0, (w - len(divider_label)) // 2)
+        try:
+            self.stdscr.attron(curses.color_pair(8))
+            self.stdscr.addnstr(sep_y, 0, "─" * max(0, w - 1), w - 1)
+            if left < w - 1:
+                self.stdscr.addnstr(sep_y, left, divider_label[: max(0, w - left - 1)], w - left - 1)
+            self.stdscr.attroff(curses.color_pair(8))
+        except curses.error:
+            pass
+
+        if self.article_translation_loading:
+            spinner = ["|", "/", "-", "\\"]
+            frame = spinner[self.trans_frame % len(spinner)]
+            self.trans_frame += 1
+            self.stdscr.attron(curses.color_pair(10) | curses.A_BOLD)
+            self.stdscr.addnstr(trans_start_y, 2, f"[ {frame} ] 正在翻译全文...", content_w)
+            self.stdscr.attroff(curses.color_pair(10) | curses.A_BOLD)
+        elif self.article_translation_text:
+            selected_pid = None
+            if self.article_paragraphs:
+                selected_pid = self.article_paragraphs[self.article_selected].get("pid")
+
+            translation_lines = []
+            if selected_pid:
+                translated_text = self.article_translation_map.get(selected_pid, "")
+                translation_lines.append(f"[{selected_pid}]")
+                if translated_text:
+                    translation_lines.extend(
+                        prepare_article_lines(translated_text, content_w, filter_noise=False)
+                    )
+                else:
+                    translation_lines.append("（该段尚无翻译内容）")
+
+            max_scroll = max(0, len(translation_lines) - trans_rows)
+            if self.article_translation_scroll > max_scroll:
+                self.article_translation_scroll = max_scroll
+            if self.article_translation_scroll < 0:
+                self.article_translation_scroll = 0
+            for i in range(trans_rows):
+                line_idx = self.article_translation_scroll + i
+                if line_idx >= len(translation_lines):
+                    break
+                draw_y = trans_start_y + i
+                if draw_y >= h - 1:
+                    break
+                line = translation_lines[line_idx]
+                if line.startswith('[') and line.endswith(']'):
+                    self.stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+                    self.stdscr.addnstr(draw_y, 2, line, content_w)
+                    self.stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+                elif line.startswith('##'):
+                    self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+                    self.stdscr.addnstr(draw_y, 2, line, content_w)
+                    self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+                elif line.startswith('#'):
+                    self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE)
+                    self.stdscr.addnstr(draw_y, 2, line, content_w)
+                    self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE)
+                elif line.startswith('> '):
+                    self.stdscr.attron(curses.color_pair(10))
+                    self.stdscr.addnstr(draw_y, 2, line, content_w)
+                    self.stdscr.attroff(curses.color_pair(10))
+                elif line.startswith('    '):
+                    self.stdscr.attron(curses.color_pair(9))
+                    self.stdscr.addnstr(draw_y, 2, line, content_w)
+                    self.stdscr.attroff(curses.color_pair(9))
+                elif line.startswith('│ '):
+                    self.stdscr.attron(curses.color_pair(8))
+                    self.stdscr.addnstr(draw_y, 2, line, content_w)
+                    self.stdscr.attroff(curses.color_pair(8))
+                elif line.startswith('• ') or (len(line) > 2 and line[0].isdigit() and line[1] == '.'):
+                    self.stdscr.attron(curses.color_pair(2))
+                    self.stdscr.addnstr(draw_y, 2, line, content_w)
+                    self.stdscr.attroff(curses.color_pair(2))
+                else:
+                    self.stdscr.addnstr(draw_y, 2, line, content_w)
+        else:
+            self.stdscr.attron(curses.color_pair(8))
+            self.stdscr.addnstr(trans_start_y, 2, "暂无全文翻译", content_w)
+            self.stdscr.attroff(curses.color_pair(8))
 
         self.stdscr.attron(curses.color_pair(6))
         status_line = f" {self.status} "
@@ -1572,18 +1919,30 @@ class HNViewer:
                 if key == 27 or key == ord('b'):
                     self.view_state = ViewState.LIST
                     self.article_text = []
+                    self.article_source_text = ""
+                    self.article_translation_text = ""
+                    self.article_translation_loading = False
+                    self.article_translation_scroll = 0
                     self.article_paragraphs = []
                     self.update_list_status()
                 elif key == ord('j') or key == curses.KEY_DOWN:
                     if self.article_selected < len(self.article_paragraphs) - 1:
                         self.article_selected += 1
+                        self.article_translation_scroll = 0
                 elif key == ord('k') or key == curses.KEY_UP:
                     if self.article_selected > 0:
                         self.article_selected -= 1
+                        self.article_translation_scroll = 0
                 elif key == ord('g'):
                     self.article_selected = 0
+                    self.article_translation_scroll = 0
                 elif key == ord('G'):
                     self.article_selected = max(0, len(self.article_paragraphs) - 1)
+                    self.article_translation_scroll = 0
+                elif key == curses.KEY_PPAGE:
+                    self.article_translation_scroll = max(0, self.article_translation_scroll - 5)
+                elif key == curses.KEY_NPAGE:
+                    self.article_translation_scroll += 5
                 elif key == ord('t') or key == ord('T'):
                     if self.article_paragraphs:
                         p = self.article_paragraphs[self.article_selected]

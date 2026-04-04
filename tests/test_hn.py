@@ -153,6 +153,26 @@ class HNViewerTests(unittest.TestCase):
         self.assertEqual(viewer.trans_result, "translated")
         self.assertEqual(viewer.cache[cache_key], "translated")
 
+    def test_full_article_translation_is_cached(self):
+        viewer = self.make_viewer()
+        paragraphs = [{"pid": "P1", "text": "hello article"}]
+        prompt = self.mod.build_article_translation_prompt(paragraphs)
+        cache_key = self.mod.get_cache_key(f"article-v2:{prompt}")
+
+        with mock.patch.object(self.mod, "call_llm", return_value="[P1]\nwhole article translated"), mock.patch.object(
+            self.mod.threading, "Thread", ImmediateThread
+        ):
+            viewer.start_article_translation(paragraphs)
+
+        self.assertEqual(viewer.article_translation_text, "[P1]\nwhole article translated")
+        self.assertEqual(viewer.article_translation_map["P1"], "whole article translated")
+        self.assertEqual(viewer.cache[cache_key], "[P1]\nwhole article translated")
+
+    def test_parse_labeled_article_translation(self):
+        parsed = self.mod.parse_labeled_article_translation("[P1]\n第一段\n\n[P2]\n第二段")
+        self.assertEqual(parsed["P1"], "第一段")
+        self.assertEqual(parsed["P2"], "第二段")
+
     def test_article_extraction_prefers_summary_over_full_body_noise(self):
         desired = "Important article sentence. " * 12
         noisy = "FILLERMARKER " * 300
@@ -180,6 +200,35 @@ class HNViewerTests(unittest.TestCase):
 
         self.assertIn("Important article sentence.", extracted)
         self.assertNotIn("FILLERMARKER", extracted)
+
+    def test_prepare_article_lines_filters_top_metadata_blocks(self):
+        text = "\n".join(
+            [
+                "8 hours ago",
+                "",
+                "Sofia Ferreira Santos",
+                "",
+                "# Headline",
+                "",
+                "Real article paragraph starts here with substance.",
+            ]
+        )
+
+        prepared = self.mod.prepare_article_lines(text, 60)
+
+        joined = "\n".join(prepared)
+        self.assertNotIn("8 hours ago", joined)
+        self.assertNotIn("Sofia Ferreira Santos", joined)
+        self.assertIn("# Headline", joined)
+        self.assertIn("Real article paragraph starts here", joined)
+
+    def test_prepare_article_lines_wraps_list_items_cleanly(self):
+        text = "• This is a long bullet point that should wrap onto the next line without losing its visual structure."
+
+        prepared = self.mod.prepare_article_lines(text, 32)
+
+        self.assertTrue(prepared[0].startswith("• "))
+        self.assertTrue(any(line.startswith("  ") for line in prepared[1:]))
 
 
 if __name__ == "__main__":
