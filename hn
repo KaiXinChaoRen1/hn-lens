@@ -7,6 +7,7 @@ os.environ.setdefault('ESCDELAY', '25')
 import curses
 import html
 import json
+import os
 import requests
 import subprocess
 import textwrap
@@ -14,13 +15,17 @@ import time
 import re
 import threading
 import hashlib
-import os
 import signal
 from enum import Enum, auto
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 
 _ctrl_c_pressed = False
+
+
+# ---------------------------------------------------------------------------
+# Terminal and text helpers
+# ---------------------------------------------------------------------------
 
 def _sigint_handler(signum, frame):
     global _ctrl_c_pressed
@@ -155,6 +160,11 @@ DEFAULT_CONFIG = {
     "prompt_item": "你是一个专业的中英翻译助手。请将以下英文内容翻译成流畅的中文，保留原文的格式和结构。内容：\n\n{text}",
 }
 
+
+# ---------------------------------------------------------------------------
+# Config and cache helpers
+# ---------------------------------------------------------------------------
+
 def ensure_config():
     """Create config file if not exists"""
     if not os.path.exists(CONFIG_DIR):
@@ -223,6 +233,47 @@ def is_error_text(text: str) -> bool:
     """Whether a string is an error message that should not be cached."""
     return bool(text) and text.strip().startswith("[错误]")
 
+def format_api_error(response) -> str:
+    """Turn an HTTP error response into a more actionable error message."""
+    status = getattr(response, "status_code", "unknown")
+    detail = ""
+
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+
+    if isinstance(payload, dict):
+        error_obj = payload.get("error")
+        if isinstance(error_obj, dict):
+            parts = []
+            for key in ("message", "type", "code"):
+                value = error_obj.get(key)
+                if value:
+                    parts.append(str(value))
+            if parts:
+                detail = " | ".join(parts)
+        elif error_obj:
+            detail = str(error_obj)
+        elif payload.get("message"):
+            detail = str(payload["message"])
+        elif payload.get("detail"):
+            detail = str(payload["detail"])
+
+    if not detail:
+        try:
+            detail = response.text.strip()
+        except Exception:
+            detail = ""
+
+    detail = normalize_whitespace(detail) if detail else ""
+    if len(detail) > 220:
+        detail = detail[:217] + "..."
+
+    if detail:
+        return f"[错误] API 请求失败 ({status}): {detail}"
+    return f"[错误] API 请求失败 ({status})"
+
 def call_llm(prompt: str, cfg: dict) -> str:
     """Call LLM API and return response text"""
     try:
@@ -244,11 +295,16 @@ def call_llm(prompt: str, cfg: dict) -> str:
         data = r.json()
         return data["choices"][0]["message"]["content"]
     except requests.exceptions.Timeout:
-        return "[错误] 请求超时，请检查网络连接"
+        return "[错误] 请求超时：大模型在 30 秒内没有返回结果"
     except requests.exceptions.ConnectionError:
-        return "[错误] 无法连接到 API 服务器"
+        return "[错误] 无法连接到 API 服务器，请检查网络或 API 地址"
+    except requests.exceptions.HTTPError as e:
+        response = getattr(e, "response", None)
+        if response is not None:
+            return format_api_error(response)
+        return f"[错误] API 请求失败: {str(e)}"
     except KeyError:
-        return "[错误] API 返回格式异常"
+        return "[错误] API 返回格式异常：缺少 choices/message/content"
     except Exception as e:
         return f"[错误] {str(e)}"
 
@@ -313,6 +369,11 @@ TAG_MAP = {
     "top": "front_page",
     "ask": "ask_hn",
 }
+
+
+# ---------------------------------------------------------------------------
+# Hacker News API helpers
+# ---------------------------------------------------------------------------
 
 def fetch_stories(feed_type, offset=0, count=INITIAL_STORY_PAGE_SIZE):
     """Fetch a batch of stories from Algolia API."""
@@ -468,6 +529,11 @@ def render_text_with_urls(stdscr, y, x, text, max_width, base_attr=0, url_attr=0
         stdscr.addnstr(y, cursor_x, suffix, remaining)
         if base_attr:
             stdscr.attroff(base_attr)
+
+
+# ---------------------------------------------------------------------------
+# Article extraction and formatting helpers
+# ---------------------------------------------------------------------------
 
 def split_article_blocks(lines):
     """Split article lines into semantic blocks separated by empty lines."""
@@ -640,6 +706,30 @@ def build_article_display_lines(paragraphs):
     if lines and not lines[-1].strip():
         lines.pop()
     return lines, rendered_paragraphs
+
+def adjust_article_scroll_for_selection(current_scroll, selected_para, visible_rows):
+    """Keep the selected paragraph fully visible when it can fit on screen."""
+    if not selected_para or visible_rows <= 0:
+        return max(0, current_scroll)
+
+    start = selected_para["start"]
+    end = selected_para["end"]
+    para_rows = end - start + 1
+    view_start = max(0, current_scroll)
+    view_end = view_start + visible_rows - 1
+
+    if para_rows >= visible_rows:
+        if start < view_start or start > view_end or end > view_end:
+            return start
+        return view_start
+
+    if start < view_start:
+        return start
+
+    if end > view_end:
+        return max(0, end - visible_rows + 1)
+
+    return view_start
 
 def build_article_translation_prompt(paragraphs):
     """Build a paragraph-numbered translation prompt for the whole article."""
@@ -939,6 +1029,8 @@ class HNViewer:
         self.article_translation_loading = False
         self.article_translation_scroll = 0
         self.article_scroll = 0
+        self.article_selected = 0
+        self.article_paragraphs: List[Dict[str, Any]] = []
         self.search_query = ""
         self.filtered_stories: List[Story] = []
         self.story_next_offset = 0
@@ -988,6 +1080,121 @@ class HNViewer:
             header_prefix = ("  " * (depth - 1)) + "└─ "
         body_prefix = " " * get_display_width(header_prefix)
         return header_prefix, body_prefix
+
+    def _reset_article_state(self):
+        """Clear article-specific state when leaving or reloading article mode."""
+        self.article_text = []
+        self.article_source_text = ""
+        self.article_translation_text = ""
+        self.article_translation_map = {}
+        self.article_translation_loading = False
+        self.article_translation_scroll = 0
+        self.article_scroll = 0
+        self.article_selected = 0
+        self.article_paragraphs = []
+
+    def _extract_article_paragraphs(self, wrapped_lines: List[str]) -> List[Dict[str, str]]:
+        """Group consecutive non-empty article lines into paragraph blocks."""
+        paragraphs: List[Dict[str, str]] = []
+        current_lines: List[str] = []
+
+        for line in wrapped_lines:
+            if line.strip():
+                current_lines.append(line)
+                continue
+            if current_lines:
+                paragraphs.append({"text": "\n".join(current_lines)})
+                current_lines = []
+
+        if current_lines:
+            paragraphs.append({"text": "\n".join(current_lines)})
+
+        return label_article_paragraphs(paragraphs)
+
+    def _draw_rich_text_line(self, y: int, x: int, line: str, max_width: int, *, selected=False):
+        """Draw one formatted article/translation line with shared styling rules."""
+        if selected:
+            base_attr = curses.color_pair(7) | curses.A_BOLD
+            if looks_like_url_text(line) or contains_url(line):
+                render_text_with_urls(
+                    self.stdscr,
+                    y,
+                    x,
+                    line,
+                    max_width,
+                    base_attr,
+                    base_attr | curses.A_UNDERLINE,
+                )
+            else:
+                self.stdscr.attron(base_attr)
+                self.stdscr.addnstr(y, x, line, max_width)
+                self.stdscr.attroff(base_attr)
+            return
+
+        if line.startswith('##'):
+            attr = curses.color_pair(1) | curses.A_BOLD
+            self.stdscr.attron(attr)
+            self.stdscr.addnstr(y, x, line, max_width)
+            self.stdscr.attroff(attr)
+        elif line.startswith('#'):
+            attr = curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE
+            self.stdscr.attron(attr)
+            self.stdscr.addnstr(y, x, line, max_width)
+            self.stdscr.attroff(attr)
+        elif line.startswith('> '):
+            attr = curses.color_pair(10)
+            self.stdscr.attron(attr)
+            self.stdscr.addnstr(y, x, line, max_width)
+            self.stdscr.attroff(attr)
+        elif line.startswith('    '):
+            attr = curses.color_pair(9)
+            self.stdscr.attron(attr)
+            self.stdscr.addnstr(y, x, line, max_width)
+            self.stdscr.attroff(attr)
+        elif line.startswith('│ '):
+            attr = curses.color_pair(8)
+            self.stdscr.attron(attr)
+            self.stdscr.addnstr(y, x, line, max_width)
+            self.stdscr.attroff(attr)
+        elif looks_like_url_text(line) or contains_url(line):
+            render_text_with_urls(
+                self.stdscr,
+                y,
+                x,
+                line,
+                max_width,
+                0,
+                curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE,
+            )
+        elif line.startswith('• ') or (len(line) > 2 and line[0].isdigit() and line[1] == '.'):
+            attr = curses.color_pair(2)
+            self.stdscr.attron(attr)
+            self.stdscr.addnstr(y, x, line, max_width)
+            self.stdscr.attroff(attr)
+        else:
+            self.stdscr.addnstr(y, x, line, max_width)
+
+    def _build_selected_article_translation_lines(self, content_w: int) -> List[str]:
+        """Return translation lines for the currently selected article paragraph."""
+        if not self.article_paragraphs:
+            return []
+
+        if is_error_text(self.article_translation_text):
+            return wrap_by_width(self.article_translation_text, content_w)
+
+        selected_pid = self.article_paragraphs[self.article_selected].get("pid")
+        if not selected_pid:
+            return []
+
+        translated_text = self.article_translation_map.get(selected_pid, "")
+        lines = [f"[{selected_pid}]"]
+        if translated_text:
+            lines.extend(prepare_article_lines(translated_text, content_w, filter_noise=False))
+        elif self.article_translation_text:
+            lines.append("（全文翻译已返回，但没有找到这一段的编号；可能是模型漏掉了段落标号）")
+        else:
+            lines.append("（该段尚无翻译内容）")
+        return lines
 
     def get_cached_stories(self, feed_type="top"):
         """Return recent cached stories for a feed when available."""
@@ -1085,12 +1292,7 @@ class HNViewer:
         self.detail_story = None
         self.all_comments = []
         self.comments = []
-        self.article_text = []
-        self.article_source_text = ""
-        self.article_translation_text = ""
-        self.article_translation_map = {}
-        self.article_translation_loading = False
-        self.article_translation_scroll = 0
+        self._reset_article_state()
         if self.search_mode:
             self.filter_stories()
             self.status = f"Search: {len(self.filtered_stories)} results | esc: exit search | j/k: nav"
@@ -1277,28 +1479,7 @@ class HNViewer:
             content_w = w - 4
             self.article_source_text = text
             wrapped = prepare_article_lines(text, content_w)
-
-            # Aggregate paragraphs: consecutive non-empty lines form one paragraph
-            article_paragraphs = []
-            para_start = None
-            for i, line in enumerate(wrapped):
-                if line.strip():
-                    if para_start is None:
-                        para_start = i
-                else:
-                    if para_start is not None:
-                        full_text = '\n'.join(wrapped[para_start:i])
-                        article_paragraphs.append({
-                            'text': full_text,
-                        })
-                        para_start = None
-            if para_start is not None:
-                full_text = '\n'.join(wrapped[para_start:])
-                article_paragraphs.append({
-                    'text': full_text,
-                })
-
-            article_paragraphs = label_article_paragraphs(article_paragraphs)
+            article_paragraphs = self._extract_article_paragraphs(wrapped)
             self.article_text, self.article_paragraphs = build_article_display_lines(article_paragraphs)
 
             self.article_scroll = 0
@@ -1507,18 +1688,14 @@ class HNViewer:
         trans_start_y = sep_y + 1
         article_visible_rows = article_rows
 
-        # Ensure selected paragraph is visible
+        # Ensure selected paragraph is visible, and fully visible when it fits.
         if self.article_paragraphs:
             sel = self.article_paragraphs[self.article_selected]
-            # Check if selected paragraph is fully or partially visible
-            sel_in_view = False
-            for i in range(article_visible_rows):
-                row_idx = self.article_scroll + i
-                if sel['start'] <= row_idx <= sel['end']:
-                    sel_in_view = True
-                    break
-            if not sel_in_view:
-                self.article_scroll = sel['start']
+            self.article_scroll = adjust_article_scroll_for_selection(
+                self.article_scroll,
+                sel,
+                article_visible_rows,
+            )
 
         # Render article section
         ry = 1
@@ -1535,59 +1712,7 @@ class HNViewer:
                 idx += 1
                 continue
 
-            if is_selected:
-                # Selected paragraph: keep the blue highlight, but only
-                # underline the actual URL spans instead of the whole line.
-                if looks_like_url_text(line) or contains_url(line):
-                    render_text_with_urls(
-                        self.stdscr,
-                        ry,
-                        2,
-                        line,
-                        content_w,
-                        curses.color_pair(7) | curses.A_BOLD,
-                        curses.color_pair(7) | curses.A_BOLD | curses.A_UNDERLINE,
-                    )
-                else:
-                    self.stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
-                    self.stdscr.addnstr(ry, 2, line, content_w)
-                    self.stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
-            elif line.startswith('##'):
-                self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-                self.stdscr.addnstr(ry, 2, line, content_w)
-                self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
-            elif line.startswith('#'):
-                self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE)
-                self.stdscr.addnstr(ry, 2, line, content_w)
-                self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE)
-            elif line.startswith('> '):
-                self.stdscr.attron(curses.color_pair(10))
-                self.stdscr.addnstr(ry, 2, line, content_w)
-                self.stdscr.attroff(curses.color_pair(10))
-            elif line.startswith('    '):
-                self.stdscr.attron(curses.color_pair(9))
-                self.stdscr.addnstr(ry, 2, line, content_w)
-                self.stdscr.attroff(curses.color_pair(9))
-            elif line.startswith('│ '):
-                self.stdscr.attron(curses.color_pair(8))
-                self.stdscr.addnstr(ry, 2, line, content_w)
-                self.stdscr.attroff(curses.color_pair(8))
-            elif looks_like_url_text(line) or contains_url(line):
-                render_text_with_urls(
-                    self.stdscr,
-                    ry,
-                    2,
-                    line,
-                    content_w,
-                    0,
-                    curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE,
-                )
-            elif line.startswith('• ') or (len(line) > 2 and line[0].isdigit() and line[1] == '.'):
-                self.stdscr.attron(curses.color_pair(2))
-                self.stdscr.addnstr(ry, 2, line, content_w)
-                self.stdscr.attroff(curses.color_pair(2))
-            else:
-                self.stdscr.addnstr(ry, 2, line, content_w)
+            self._draw_rich_text_line(ry, 2, line, content_w, selected=is_selected)
 
             ry += 1
             idx += 1
@@ -1612,20 +1737,7 @@ class HNViewer:
             self.stdscr.addnstr(trans_start_y, 2, f"[ {frame} ] 正在翻译全文...", content_w)
             self.stdscr.attroff(curses.color_pair(10) | curses.A_BOLD)
         elif self.article_translation_text:
-            selected_pid = None
-            if self.article_paragraphs:
-                selected_pid = self.article_paragraphs[self.article_selected].get("pid")
-
-            translation_lines = []
-            if selected_pid:
-                translated_text = self.article_translation_map.get(selected_pid, "")
-                translation_lines.append(f"[{selected_pid}]")
-                if translated_text:
-                    translation_lines.extend(
-                        prepare_article_lines(translated_text, content_w, filter_noise=False)
-                    )
-                else:
-                    translation_lines.append("（该段尚无翻译内容）")
+            translation_lines = self._build_selected_article_translation_lines(content_w)
 
             max_scroll = max(0, len(translation_lines) - trans_rows)
             if self.article_translation_scroll > max_scroll:
@@ -1644,42 +1756,8 @@ class HNViewer:
                     self.stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
                     self.stdscr.addnstr(draw_y, 2, line, content_w)
                     self.stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
-                elif line.startswith('##'):
-                    self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-                    self.stdscr.addnstr(draw_y, 2, line, content_w)
-                    self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
-                elif line.startswith('#'):
-                    self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE)
-                    self.stdscr.addnstr(draw_y, 2, line, content_w)
-                    self.stdscr.attroff(curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE)
-                elif line.startswith('> '):
-                    self.stdscr.attron(curses.color_pair(10))
-                    self.stdscr.addnstr(draw_y, 2, line, content_w)
-                    self.stdscr.attroff(curses.color_pair(10))
-                elif line.startswith('    '):
-                    self.stdscr.attron(curses.color_pair(9))
-                    self.stdscr.addnstr(draw_y, 2, line, content_w)
-                    self.stdscr.attroff(curses.color_pair(9))
-                elif line.startswith('│ '):
-                    self.stdscr.attron(curses.color_pair(8))
-                    self.stdscr.addnstr(draw_y, 2, line, content_w)
-                    self.stdscr.attroff(curses.color_pair(8))
-                elif looks_like_url_text(line) or contains_url(line):
-                    render_text_with_urls(
-                        self.stdscr,
-                        draw_y,
-                        2,
-                        line,
-                        content_w,
-                        0,
-                        curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE,
-                    )
-                elif line.startswith('• ') or (len(line) > 2 and line[0].isdigit() and line[1] == '.'):
-                    self.stdscr.attron(curses.color_pair(2))
-                    self.stdscr.addnstr(draw_y, 2, line, content_w)
-                    self.stdscr.attroff(curses.color_pair(2))
                 else:
-                    self.stdscr.addnstr(draw_y, 2, line, content_w)
+                    self._draw_rich_text_line(draw_y, 2, line, content_w)
         else:
             self.stdscr.attron(curses.color_pair(8))
             self.stdscr.addnstr(trans_start_y, 2, "暂无全文翻译", content_w)
@@ -2092,12 +2170,7 @@ class HNViewer:
             if self.view_state == ViewState.ARTICLE:
                 if key == 27 or key == ord('b'):
                     self.view_state = ViewState.LIST
-                    self.article_text = []
-                    self.article_source_text = ""
-                    self.article_translation_text = ""
-                    self.article_translation_loading = False
-                    self.article_translation_scroll = 0
-                    self.article_paragraphs = []
+                    self._reset_article_state()
                     self.update_list_status()
                 elif key == ord('j') or key == curses.KEY_DOWN:
                     if self.article_selected < len(self.article_paragraphs) - 1:

@@ -5,6 +5,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest import mock
+import requests
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -246,6 +247,56 @@ class HNViewerTests(unittest.TestCase):
     def test_prepare_article_lines_marks_link_lines(self):
         prepared = self.mod.prepare_article_lines("https://example.com/path", 60, filter_noise=False)
         self.assertEqual(prepared[0], "[link] https://example.com/path")
+
+    def test_adjust_article_scroll_shows_full_selected_paragraph_when_it_fits(self):
+        selected = {"start": 8, "end": 11}
+        adjusted = self.mod.adjust_article_scroll_for_selection(0, selected, 10)
+        self.assertEqual(adjusted, 2)
+
+    def test_adjust_article_scroll_keeps_long_paragraph_top_aligned(self):
+        selected = {"start": 8, "end": 20}
+        adjusted = self.mod.adjust_article_scroll_for_selection(0, selected, 10)
+        self.assertEqual(adjusted, 8)
+
+    def test_call_llm_http_error_includes_api_message(self):
+        response = mock.Mock()
+        response.status_code = 400
+        response.json.return_value = {
+            "error": {
+                "message": "context length exceeded",
+                "type": "invalid_request_error",
+                "code": "context_length_exceeded",
+            }
+        }
+        http_error = requests.exceptions.HTTPError(response=response)
+
+        with mock.patch.object(self.mod.requests, "post", side_effect=http_error):
+            result = self.mod.call_llm("hello", self.mod.load_config())
+
+        self.assertIn("API 请求失败 (400)", result)
+        self.assertIn("context length exceeded", result)
+
+    def test_article_translation_lines_show_specific_error_text(self):
+        viewer = self.make_viewer()
+        viewer.article_paragraphs = [{"pid": "P1", "text": "hello"}]
+        viewer.article_selected = 0
+        viewer.article_translation_text = "[错误] 请求超时：大模型在 30 秒内没有返回结果"
+
+        lines = viewer._build_selected_article_translation_lines(60)
+
+        self.assertEqual(lines[0], "[错误] 请求超时：大模型在 30 秒内没有返回结果")
+
+    def test_article_translation_lines_explain_missing_segment_label(self):
+        viewer = self.make_viewer()
+        viewer.article_paragraphs = [{"pid": "P2", "text": "hello"}]
+        viewer.article_selected = 0
+        viewer.article_translation_text = "[P1]\n第一段"
+        viewer.article_translation_map = {"P1": "第一段"}
+
+        lines = viewer._build_selected_article_translation_lines(60)
+
+        self.assertEqual(lines[0], "[P2]")
+        self.assertIn("没有找到这一段的编号", lines[1])
 
 
 if __name__ == "__main__":
