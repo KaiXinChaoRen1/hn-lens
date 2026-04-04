@@ -230,6 +230,23 @@ class HNViewerTests(unittest.TestCase):
         self.assertTrue(prepared[0].startswith("• "))
         self.assertTrue(any(line.startswith("  ") for line in prepared[1:]))
 
+    def test_wrap_by_width_keeps_english_words_intact(self):
+        wrapped = self.mod.wrap_by_width("hello world translation test", 12)
+        self.assertEqual(wrapped, ["hello world", "translation", "test"])
+
+    def test_wrap_by_width_still_breaks_very_long_tokens(self):
+        wrapped = self.mod.wrap_by_width("supercalifragilisticexpialidocious", 10)
+        self.assertGreater(len(wrapped), 1)
+        self.assertTrue(all(self.mod.get_display_width(part) <= 10 for part in wrapped))
+
+    def test_strip_html_decodes_html_entities_in_urls(self):
+        text = "https:&#x2F;&#x2F;github.com&#x2F;openclaw"
+        self.assertEqual(self.mod.strip_html(text), "https://github.com/openclaw")
+
+    def test_prepare_article_lines_marks_link_lines(self):
+        prepared = self.mod.prepare_article_lines("https://example.com/path", 60, filter_noise=False)
+        self.assertEqual(prepared[0], "[link] https://example.com/path")
+
 
 if __name__ == "__main__":
     unittest.main()

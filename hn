@@ -5,6 +5,7 @@ import os
 os.environ.setdefault('ESCDELAY', '25')
 
 import curses
+import html
 import json
 import requests
 import subprocess
@@ -52,10 +53,53 @@ def get_display_width(text):
             width += 1
     return width
 
+def split_wrap_tokens(line):
+    """Split a line into whitespace, ASCII-word, and single-char tokens."""
+    tokens = []
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch.isspace():
+            j = i + 1
+            while j < len(line) and line[j].isspace():
+                j += 1
+            tokens.append(line[i:j])
+            i = j
+        elif ord(ch) < 128 and not ch.isspace():
+            j = i + 1
+            while j < len(line) and ord(line[j]) < 128 and not line[j].isspace():
+                j += 1
+            tokens.append(line[i:j])
+            i = j
+        else:
+            tokens.append(ch)
+            i += 1
+    return tokens
+
+def wrap_long_token(token, max_width):
+    """Hard-wrap a single token that is wider than the available width."""
+    parts = []
+    current = ""
+    current_width = 0
+    for ch in token:
+        ch_width = get_display_width(ch)
+        if current and current_width + ch_width > max_width:
+            parts.append(current)
+            current = ch
+            current_width = ch_width
+        else:
+            current += ch
+            current_width += ch_width
+    if current:
+        parts.append(current)
+    return parts if parts else [""]
+
 def wrap_by_width(text, max_width):
     """Wrap text by display width instead of character count"""
     if not text:
         return [""]
+    if max_width <= 1:
+        return [text]
     lines = text.split("\n")
     result = []
     for line in lines:
@@ -64,22 +108,36 @@ def wrap_by_width(text, max_width):
             continue
         current = ""
         current_width = 0
-        for ch in line:
-            ch_width = 2 if ord(ch) > 0x1100 and (
-                ord(ch) <= 0x115f or 0x2e80 <= ord(ch) <= 0x9fff or
-                0xac00 <= ord(ch) <= 0xd7af or 0xf900 <= ord(ch) <= 0xfaff or
-                0xff01 <= ord(ch) <= 0xff60 or 0xffe0 <= ord(ch) <= 0xffe6 or
-                0x20000 <= ord(ch) <= 0x2a6df or 0x2a700 <= ord(ch) <= 0x2ebef
-            ) else 1
-            if current_width + ch_width > max_width and current:
-                result.append(current)
-                current = ch
-                current_width = ch_width
+        for token in split_wrap_tokens(line):
+            token_width = get_display_width(token)
+
+            if current and current_width + token_width > max_width:
+                if token.isspace():
+                    result.append(current.rstrip())
+                    current = ""
+                    current_width = 0
+                    continue
+
+                result.append(current.rstrip())
+                current = ""
+                current_width = 0
+
+            if token_width > max_width and not token.isspace():
+                wrapped_parts = wrap_long_token(token, max_width)
+                if current:
+                    result.append(current.rstrip())
+                    current = ""
+                    current_width = 0
+                result.extend(wrapped_parts[:-1])
+                current = wrapped_parts[-1]
+                current_width = get_display_width(current)
+            elif not current and token.isspace():
+                continue
             else:
-                current += ch
-                current_width += ch_width
+                current += token
+                current_width += token_width
         if current:
-            result.append(current)
+            result.append(current.rstrip())
     return result if result else [""]
 
 ALGOLIA_API = "https://hn.algolia.com/api/v1"
@@ -329,7 +387,7 @@ def strip_html(text):
     if not text:
         return ""
     clean = re.sub(r'<[^>]+>', '', text)
-    clean = clean.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('&quot;', '"').replace('&#x27;', "'").replace('&nbsp;', ' ')
+    clean = html.unescape(clean)
     clean = re.sub(r'\n{3,}', '\n\n', clean)
     return clean.strip()
 
@@ -351,6 +409,65 @@ def is_structured_article_line(line):
         or bool(re.match(r'^\d+\.\s', line))
         or ' | ' in line
     )
+
+def looks_like_url_text(text):
+    """Whether a line/token is primarily a URL."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    stripped = stripped.replace("[link] ", "").replace("URL: ", "")
+    return bool(re.match(r'^(https?://|www\.)\S+$', stripped))
+
+def contains_url(text):
+    """Whether text contains an HTTP(S) URL."""
+    return bool(re.search(r'(https?://|www\.)\S+', text))
+
+def render_text_with_urls(stdscr, y, x, text, max_width, base_attr=0, url_attr=0):
+    """Render a line while styling only the URL spans differently."""
+    if max_width <= 0:
+        return
+    pattern = re.compile(r'(https?://\S+|www\.\S+)')
+    remaining = max_width
+    cursor_x = x
+    last_end = 0
+
+    for match in pattern.finditer(text):
+        prefix = text[last_end:match.start()]
+        url = match.group(0)
+
+        if prefix and remaining > 0:
+            if base_attr:
+                stdscr.attron(base_attr)
+            stdscr.addnstr(y, cursor_x, prefix, remaining)
+            if base_attr:
+                stdscr.attroff(base_attr)
+            drawn = min(len(prefix), remaining)
+            cursor_x += drawn
+            remaining -= drawn
+            if remaining <= 0:
+                return
+
+        if url and remaining > 0:
+            if url_attr:
+                stdscr.attron(url_attr)
+            stdscr.addnstr(y, cursor_x, url, remaining)
+            if url_attr:
+                stdscr.attroff(url_attr)
+            drawn = min(len(url), remaining)
+            cursor_x += drawn
+            remaining -= drawn
+            if remaining <= 0:
+                return
+
+        last_end = match.end()
+
+    suffix = text[last_end:]
+    if suffix and remaining > 0:
+        if base_attr:
+            stdscr.attron(base_attr)
+        stdscr.addnstr(y, cursor_x, suffix, remaining)
+        if base_attr:
+            stdscr.attroff(base_attr)
 
 def split_article_blocks(lines):
     """Split article lines into semantic blocks separated by empty lines."""
@@ -465,7 +582,10 @@ def wrap_article_block(block, content_w):
         return wrapped
 
     for line in block:
-        wrapped.extend(wrap_by_width(line, content_w))
+        if looks_like_url_text(line):
+            wrapped.extend(wrap_by_width(f"[link] {line}", content_w))
+        else:
+            wrapped.extend(wrap_by_width(line, content_w))
     return wrapped
 
 def prepare_article_lines(text, content_w, filter_noise=True):
@@ -1416,10 +1536,22 @@ class HNViewer:
                 continue
 
             if is_selected:
-                # Selected paragraph: highlight with color_pair(7)
-                self.stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
-                self.stdscr.addnstr(ry, 2, line, content_w)
-                self.stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
+                # Selected paragraph: keep the blue highlight, but only
+                # underline the actual URL spans instead of the whole line.
+                if looks_like_url_text(line) or contains_url(line):
+                    render_text_with_urls(
+                        self.stdscr,
+                        ry,
+                        2,
+                        line,
+                        content_w,
+                        curses.color_pair(7) | curses.A_BOLD,
+                        curses.color_pair(7) | curses.A_BOLD | curses.A_UNDERLINE,
+                    )
+                else:
+                    self.stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
+                    self.stdscr.addnstr(ry, 2, line, content_w)
+                    self.stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
             elif line.startswith('##'):
                 self.stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
                 self.stdscr.addnstr(ry, 2, line, content_w)
@@ -1440,6 +1572,16 @@ class HNViewer:
                 self.stdscr.attron(curses.color_pair(8))
                 self.stdscr.addnstr(ry, 2, line, content_w)
                 self.stdscr.attroff(curses.color_pair(8))
+            elif looks_like_url_text(line) or contains_url(line):
+                render_text_with_urls(
+                    self.stdscr,
+                    ry,
+                    2,
+                    line,
+                    content_w,
+                    0,
+                    curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE,
+                )
             elif line.startswith('• ') or (len(line) > 2 and line[0].isdigit() and line[1] == '.'):
                 self.stdscr.attron(curses.color_pair(2))
                 self.stdscr.addnstr(ry, 2, line, content_w)
@@ -1522,6 +1664,16 @@ class HNViewer:
                     self.stdscr.attron(curses.color_pair(8))
                     self.stdscr.addnstr(draw_y, 2, line, content_w)
                     self.stdscr.attroff(curses.color_pair(8))
+                elif looks_like_url_text(line) or contains_url(line):
+                    render_text_with_urls(
+                        self.stdscr,
+                        draw_y,
+                        2,
+                        line,
+                        content_w,
+                        0,
+                        curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE,
+                    )
                 elif line.startswith('• ') or (len(line) > 2 and line[0].isdigit() and line[1] == '.'):
                     self.stdscr.attron(curses.color_pair(2))
                     self.stdscr.addnstr(draw_y, 2, line, content_w)
@@ -1642,14 +1794,36 @@ class HNViewer:
                     self.stdscr.attron(curses.color_pair(5))
                     self.stdscr.addnstr(row, 0, body_indent.ljust(w - 1), w - 1)
                     self.stdscr.attroff(curses.color_pair(5))
-                    self.stdscr.attron(curses.color_pair(5))
-                    self.stdscr.addnstr(row, len(body_indent), bline, w - len(body_indent) - 1)
-                    self.stdscr.attroff(curses.color_pair(5))
+                    if looks_like_url_text(bline) or contains_url(bline):
+                        render_text_with_urls(
+                            self.stdscr,
+                            row,
+                            len(body_indent),
+                            bline,
+                            w - len(body_indent) - 1,
+                            curses.color_pair(5),
+                            curses.color_pair(7) | curses.A_BOLD | curses.A_UNDERLINE,
+                        )
+                    else:
+                        self.stdscr.attron(curses.color_pair(5))
+                        self.stdscr.addnstr(row, len(body_indent), bline, w - len(body_indent) - 1)
+                        self.stdscr.attroff(curses.color_pair(5))
                 else:
                     self.stdscr.attron(curses.color_pair(8))
                     self.stdscr.addnstr(row, 0, body_indent, w - 1)
                     self.stdscr.attroff(curses.color_pair(8))
-                    self.stdscr.addnstr(row, len(body_indent), bline, w - len(body_indent) - 1)
+                    if looks_like_url_text(bline) or contains_url(bline):
+                        render_text_with_urls(
+                            self.stdscr,
+                            row,
+                            len(body_indent),
+                            bline,
+                            w - len(body_indent) - 1,
+                            0,
+                            curses.color_pair(1) | curses.A_BOLD | curses.A_UNDERLINE,
+                        )
+                    else:
+                        self.stdscr.addnstr(row, len(body_indent), bline, w - len(body_indent) - 1)
                 row += 1
 
         self.stdscr.attron(curses.color_pair(6))
