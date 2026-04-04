@@ -25,6 +25,13 @@ def _sigint_handler(signum, frame):
     global _ctrl_c_pressed
     _ctrl_c_pressed = True
 
+def safe_curs_set(visibility):
+    """Best-effort cursor visibility change for terminals that support it."""
+    try:
+        curses.curs_set(visibility)
+    except curses.error:
+        pass
+
 def get_display_width(text):
     """Calculate display width of a string (CJK chars = 2, others = 1)"""
     width = 0
@@ -79,6 +86,8 @@ ALGOLIA_API = "https://hn.algolia.com/api/v1"
 CONFIG_DIR = os.path.expanduser("~/.hn")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 CACHE_FILE = os.path.join(CONFIG_DIR, "cache.json")
+STORIES_CACHE_FILE = os.path.join(CONFIG_DIR, "stories_cache.json")
+STORIES_CACHE_TTL = 180
 
 DEFAULT_CONFIG = {
     "api_url": "https://api.deepseek.com/v1/chat/completions",
@@ -129,8 +138,32 @@ def save_cache(cache):
     except:
         pass
 
+def load_stories_cache() -> Dict[str, Any]:
+    """Load cached feed snapshots."""
+    if os.path.exists(STORIES_CACHE_FILE):
+        try:
+            with open(STORIES_CACHE_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+def save_stories_cache(cache: Dict[str, Any]):
+    """Persist cached feed snapshots."""
+    try:
+        if not os.path.exists(CONFIG_DIR):
+            os.makedirs(CONFIG_DIR)
+        with open(STORIES_CACHE_FILE, "w") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except:
+        pass
+
 def get_cache_key(text: str) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+def is_error_text(text: str) -> bool:
+    """Whether a string is an error message that should not be cached."""
+    return bool(text) and text.strip().startswith("[错误]")
 
 def call_llm(prompt: str, cfg: dict) -> str:
     """Call LLM API and return response text"""
@@ -213,22 +246,32 @@ class Comment:
     depth: int
 
 
+INITIAL_STORY_PAGE_SIZE = 20
+STORY_LOAD_MORE_SIZE = 10
+INITIAL_COMMENT_BATCH_SIZE = 20
+COMMENT_LOAD_MORE_SIZE = 10
+
 TAG_MAP = {
     "top": "front_page",
     "ask": "ask_hn",
 }
 
-def fetch_stories(feed_type, count=50) -> List[Story]:
-    """Fetch stories from Algolia API"""
+def fetch_stories(feed_type, offset=0, count=INITIAL_STORY_PAGE_SIZE):
+    """Fetch a batch of stories from Algolia API."""
     tag = TAG_MAP.get(feed_type, "front_page")
-    url = f"{ALGOLIA_API}/search?tags={tag}&hitsPerPage={count}"
+    page = offset // count if count > 0 else 0
+    url = f"{ALGOLIA_API}/search?tags={tag}&hitsPerPage={count}&page={page}"
     try:
         r = requests.get(url, timeout=15)
         r.raise_for_status()
         data = r.json()
-        return [Story.from_api(hit) for hit in data.get("hits", [])]
-    except Exception:
-        return []
+        stories = [Story.from_api(hit) for hit in data.get("hits", [])]
+        current_page = data.get("page", page)
+        total_pages = data.get("nbPages", current_page + 1)
+        has_more = current_page + 1 < total_pages and bool(stories)
+        return stories, has_more, None
+    except Exception as e:
+        return [], False, str(e)
 
 def fetch_comments(story_id):
     """Fetch a story with its comments via Algolia items API"""
@@ -290,82 +333,247 @@ def strip_html(text):
     clean = re.sub(r'\n{3,}', '\n\n', clean)
     return clean.strip()
 
+def normalize_whitespace(text):
+    """Collapse repeated inline whitespace while preserving paragraph breaks."""
+    if not text:
+        return ""
+    return re.sub(r'\s+', ' ', text).strip()
+
+def is_structured_article_line(line):
+    """Whether a rendered article line already has intentional structure."""
+    if not line:
+        return False
+    return (
+        line.startswith('#')
+        or line.startswith('> ')
+        or line.startswith('• ')
+        or line.startswith('    ')
+        or bool(re.match(r'^\d+\.\s', line))
+        or ' | ' in line
+    )
+
 def fetch_article_text(url):
     """Fetch article content and convert HTML to structured plain text"""
     if not url:
         return None
     try:
-        from readability import Document
-        from bs4 import BeautifulSoup, NavigableString, Tag
-
         r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"})
         r.raise_for_status()
+        html = r.text
 
-        doc = Document(r.text)
-        soup = BeautifulSoup(doc.summary(), 'html.parser')
+        try:
+            from readability import Document
+            from bs4 import BeautifulSoup, Comment, NavigableString
+        except Exception:
+            try:
+                from bs4 import BeautifulSoup, Comment, NavigableString
+            except Exception:
+                # Last-resort fallback: return stripped raw HTML text.
+                clean = strip_html(html)
+                return clean[:10000] if clean else None
 
-        for tag in soup(['script', 'style', 'nav', 'footer', 'header', 'aside', 'img', 'figure', 'figcaption', 'iframe', 'video', 'audio']):
-            tag.decompose()
+        noise_keywords = (
+            'ad', 'ads', 'advert', 'banner', 'cookie', 'consent', 'footer',
+            'menu', 'nav', 'navbar', 'sidebar', 'share', 'social', 'promo',
+            'related', 'recommend', 'trending', 'newsletter', 'subscribe',
+            'signup', 'sign-up', 'signin', 'sign-in', 'outbrain', 'taboola',
+            'breadcrumb', 'comment', 'responses', 'reply'
+        )
+        positive_keywords = (
+            'article', 'content', 'entry', 'main', 'post', 'story', 'body',
+            'copy', 'text', 'page'
+        )
 
-        lines = []
+        def parse_soup(fragment):
+            return BeautifulSoup(fragment, 'html.parser')
 
-        def walk(node):
+        def candidate_text_len(node):
+            return len(normalize_whitespace(node.get_text(" ", strip=True)))
+
+        def choose_root_soup():
+            candidates = []
+            try:
+                doc = Document(html)
+                summary_html = doc.summary()
+                if summary_html:
+                    candidates.append(("summary", parse_soup(summary_html)))
+            except Exception:
+                pass
+
+            full_soup = parse_soup(html)
+            body = full_soup.body or full_soup
+            candidates.append(("body", parse_soup(str(body))))
+
+            best = None
+            best_score = -1
+            for source, candidate in candidates:
+                text_len = candidate_text_len(candidate)
+                if source == "summary" and text_len >= 180:
+                    return candidate
+
+                score = text_len
+                if source == "summary":
+                    score += 500
+
+                if score > best_score:
+                    best = candidate
+                    best_score = score
+            return best or parse_soup(html)
+
+        def attr_blob(node):
+            attrs = []
+            for key in ('id', 'class', 'role', 'aria-label', 'data-testid', 'data-component'):
+                value = node.get(key)
+                if isinstance(value, list):
+                    attrs.extend(value)
+                elif value:
+                    attrs.append(str(value))
+            return " ".join(attrs).lower()
+
+        def is_noise_node(node):
+            if not getattr(node, 'name', None):
+                return False
+            if node.name in ('script', 'style', 'nav', 'footer', 'header', 'aside', 'form', 'button', 'noscript'):
+                return True
+            if node.name in ('img', 'svg', 'canvas', 'iframe', 'video', 'audio', 'figure', 'figcaption'):
+                return True
+
+            attrs = attr_blob(node)
+            if attrs:
+                has_noise = any(keyword in attrs for keyword in noise_keywords)
+                has_positive = any(keyword in attrs for keyword in positive_keywords)
+                if has_noise and not has_positive:
+                    return True
+
+            text = normalize_whitespace(node.get_text(" ", strip=True))
+            text_len = len(text)
+            if text_len == 0:
+                return False
+
+            links = node.find_all('a')
+            if not links:
+                return False
+
+            link_text_len = sum(len(normalize_whitespace(link.get_text(" ", strip=True))) for link in links)
+            link_density = link_text_len / max(text_len, 1)
+            if len(links) >= 6 and link_density > 0.55:
+                return True
+            if len(links) >= 4 and text_len < 140 and link_density > 0.45:
+                return True
+            return False
+
+        def clean_soup(soup):
+            for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+                comment.extract()
+
+            for node in list(soup.find_all(True)):
+                if is_noise_node(node):
+                    node.decompose()
+
+            for node in soup.find_all(True):
+                if node.name in ('div', 'section', 'article', 'main'):
+                    if not normalize_whitespace(node.get_text(" ", strip=True)):
+                        node.decompose()
+            return soup
+
+        def append_block(lines, text, prefix=""):
+            if not text:
+                return
+            text_lines = [normalize_whitespace(line) for line in text.splitlines()]
+            text_lines = [line for line in text_lines if line]
+            if not text_lines:
+                return
+            lines.append("")
+            for line in text_lines:
+                lines.append(f"{prefix}{line}" if prefix else line)
+            lines.append("")
+
+        def render_node(node, lines):
             if isinstance(node, NavigableString):
-                t = node.strip()
-                if t:
-                    lines.append(t)
+                return
+            if not getattr(node, 'name', None):
                 return
 
             tag = node.name
-            if tag == 'p':
-                lines.append('')
-                for c in node.children:
-                    walk(c)
-                lines.append('')
-            elif tag == 'h1':
-                lines.append('')
-                lines.append(f"# {node.get_text(strip=True)}")
-                lines.append('')
-            elif tag == 'h2':
-                lines.append('')
-                lines.append(f"## {node.get_text(strip=True)}")
-                lines.append('')
-            elif tag in ('h3', 'h4', 'h5', 'h6'):
-                lines.append('')
-                lines.append(node.get_text(strip=True))
-                lines.append('')
-            elif tag == 'blockquote':
-                lines.append('')
-                for c in node.children:
-                    walk(c)
-                lines.append('')
-            elif tag == 'ul':
-                lines.append('')
-                for li in node.find_all('li', recursive=False):
-                    lines.append(f"• {li.get_text(strip=True)}")
-                lines.append('')
-            elif tag == 'ol':
-                lines.append('')
-                for i, li in enumerate(node.find_all('li', recursive=False), 1):
-                    lines.append(f"{i}. {li.get_text(strip=True)}")
-                lines.append('')
-            elif tag == 'a':
-                href = node.get('href', '')
-                txt = node.get_text(strip=True)
-                if href and txt:
-                    lines.append(f"[{txt}]({href})")
-                elif txt:
-                    lines.append(txt)
-            elif tag in ('br', 'hr'):
-                lines.append('')
-            elif tag in ('div', 'section', 'article', 'main', 'body', 'blockquote'):
-                for c in node.children:
-                    walk(c)
-            else:
-                for c in node.children:
-                    walk(c)
+            if tag in ('article', 'main', 'section', 'div', 'body'):
+                for child in node.children:
+                    render_node(child, lines)
+                return
 
-        walk(soup)
+            if tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+                level = min(3, int(tag[1]))
+                text = normalize_whitespace(node.get_text(" ", strip=True))
+                append_block(lines, f"{'#' * level} {text}" if text else "")
+                return
+
+            if tag == 'p':
+                append_block(lines, normalize_whitespace(node.get_text(" ", strip=True)))
+                return
+
+            if tag == 'blockquote':
+                text = node.get_text("\n", strip=True)
+                append_block(lines, text, prefix="> ")
+                return
+
+            if tag == 'pre':
+                text = node.get_text("\n", strip=True)
+                if text:
+                    lines.append("")
+                    for raw in text.splitlines():
+                        lines.append(f"    {raw.rstrip()}")
+                    lines.append("")
+                return
+
+            if tag == 'ul':
+                items = []
+                for li in node.find_all('li', recursive=False):
+                    item = normalize_whitespace(li.get_text(" ", strip=True))
+                    if item:
+                        items.append(f"• {item}")
+                append_block(lines, "\n".join(items))
+                return
+
+            if tag == 'ol':
+                items = []
+                for idx, li in enumerate(node.find_all('li', recursive=False), 1):
+                    item = normalize_whitespace(li.get_text(" ", strip=True))
+                    if item:
+                        items.append(f"{idx}. {item}")
+                append_block(lines, "\n".join(items))
+                return
+
+            if tag == 'table':
+                rows = []
+                for tr in node.find_all('tr'):
+                    cells = [normalize_whitespace(cell.get_text(" ", strip=True)) for cell in tr.find_all(['th', 'td'])]
+                    cells = [cell for cell in cells if cell]
+                    if cells:
+                        rows.append(" | ".join(cells))
+                append_block(lines, "\n".join(rows))
+                return
+
+            if tag == 'hr':
+                append_block(lines, "---")
+                return
+
+            if tag in ('br',):
+                lines.append("")
+                return
+
+            text = normalize_whitespace(node.get_text(" ", strip=True))
+            if text and not node.find(['p', 'ul', 'ol', 'pre', 'blockquote', 'table', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+                append_block(lines, text)
+                return
+
+            for child in node.children:
+                render_node(child, lines)
+
+        soup = clean_soup(choose_root_soup())
+        root = soup.find(['article', 'main']) or soup.body or soup
+
+        lines = []
+        for child in root.children:
+            render_node(child, lines)
 
         # Deduplicate empty lines
         out = []
@@ -377,7 +585,10 @@ def fetch_article_text(url):
             out.append(l)
             last_empty = empty
 
-        return '\n'.join(out).strip()[:10000]
+        rendered = '\n'.join(out).strip()
+        if not rendered:
+            rendered = strip_html(str(root))
+        return rendered[:10000] if rendered else None
     except Exception:
         return None
 
@@ -393,6 +604,7 @@ class HNViewer:
         self.view_state = ViewState.LIST
         self.search_mode = False  # True when actively typing search
         self.detail_story: Optional[Story] = None
+        self.all_comments: List[Comment] = []
         self.comments: List[Comment] = []
         self.comment_scroll = 0
         self.comment_selected = 0
@@ -400,23 +612,35 @@ class HNViewer:
         self.article_scroll = 0
         self.search_query = ""
         self.filtered_stories: List[Story] = []
-        curses.curs_set(0)
+        self.story_next_offset = 0
+        self.story_has_more = False
+        self.loading_more_stories = False
+        try:
+            safe_curs_set(0)
+        except Exception:
+            pass
         self.stdscr.timeout(10)
         self.stdscr.keypad(True)
-        curses.start_color()
-        curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_CYAN, -1)
-        curses.init_pair(2, curses.COLOR_YELLOW, -1)
-        curses.init_pair(3, curses.COLOR_GREEN, -1)
-        curses.init_pair(4, curses.COLOR_RED, -1)
-        curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
-        curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_WHITE)
-        curses.init_pair(7, curses.COLOR_MAGENTA, curses.COLOR_BLUE)
-        curses.init_pair(8, curses.COLOR_WHITE, -1)
-        curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_BLACK)
-        curses.init_pair(10, curses.COLOR_CYAN, -1)
+        if curses.has_colors():
+            try:
+                curses.start_color()
+                curses.use_default_colors()
+                curses.init_pair(1, curses.COLOR_CYAN, -1)
+                curses.init_pair(2, curses.COLOR_YELLOW, -1)
+                curses.init_pair(3, curses.COLOR_GREEN, -1)
+                curses.init_pair(4, curses.COLOR_RED, -1)
+                curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
+                curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_WHITE)
+                curses.init_pair(7, curses.COLOR_MAGENTA, curses.COLOR_BLUE)
+                curses.init_pair(8, curses.COLOR_WHITE, -1)
+                curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_BLACK)
+                curses.init_pair(10, curses.COLOR_CYAN, -1)
+            except curses.error:
+                pass
         self.cfg = load_config()
         self.cache = load_cache()
+        self.stories_cache = load_stories_cache()
+        self.pending_story_refresh = None
         self.translating = False
         self.trans_result = ""
         self.trans_source = ""
@@ -426,25 +650,222 @@ class HNViewer:
         self.confirm_exit = False
         self.confirm_exit_time = 0
 
-    def load_stories(self, feed_type="top"):
-        self.loading = True
-        self.status = "Loading..."
+    def _comment_prefixes(self, depth: int):
+        """Build softer tree prefixes for comment header/body."""
+        depth = min(depth, 8)
+        if depth <= 0:
+            header_prefix = "• "
+        else:
+            header_prefix = ("  " * (depth - 1)) + "└─ "
+        body_prefix = " " * get_display_width(header_prefix)
+        return header_prefix, body_prefix
+
+    def get_cached_stories(self, feed_type="top"):
+        """Return recent cached stories for a feed when available."""
+        cached = self.stories_cache.get(feed_type)
+        if not cached:
+            return None
+        if time.time() - cached.get("saved_at", 0) > STORIES_CACHE_TTL:
+            return None
+        items = cached.get("stories", [])
+        if not items:
+            return None
+        try:
+            stories = [Story.from_api(item) for item in items]
+        except Exception:
+            return None
+        return stories, bool(cached.get("has_more", False))
+
+    def store_cached_stories(self, feed_type: str, stories: List[Story], has_more: bool):
+        """Save the latest feed snapshot for faster next launch."""
+        self.stories_cache[feed_type] = {
+            "saved_at": time.time(),
+            "has_more": has_more,
+            "stories": [
+                {
+                    "title": story.title,
+                    "author": story.author,
+                    "points": story.points,
+                    "num_comments": story.num_comments,
+                    "url": story.url,
+                    "objectID": story.object_id,
+                    "created_at_i": story.created_at,
+                    "_tags": [story.story_type],
+                }
+                for story in stories
+            ],
+        }
+        save_stories_cache(self.stories_cache)
+
+    def load_stories(self, feed_type="top", force_refresh=False):
         self.current_feed = feed_type
-        self.draw_main()
-        self.stdscr.refresh()
-        self.stories = fetch_stories(feed_type, 50)
+        cached = None
+        previous_stories = list(self.stories)
+        previous_has_more = self.story_has_more
+        previous_next_offset = self.story_next_offset
+        if force_refresh:
+            if self.pending_story_refresh and self.pending_story_refresh["feed_type"] == feed_type:
+                self.pending_story_refresh = None
+            self.loading = True
+            self.status = "Refreshing..."
+            self.draw_main()
+            self.stdscr.refresh()
+            stories, has_more, error = fetch_stories(feed_type, offset=0, count=INITIAL_STORY_PAGE_SIZE)
+            if error:
+                self.stories = previous_stories
+                self.story_has_more = previous_has_more
+                self.story_next_offset = previous_next_offset
+            else:
+                self.stories = stories
+                self.story_next_offset = len(stories)
+                self.story_has_more = has_more
+            self.loading = False
+            if not error and stories:
+                self.store_cached_stories(feed_type, stories, has_more)
+        else:
+            cached = self.get_cached_stories(feed_type)
+            if cached:
+                stories, has_more = cached
+                self.stories = stories
+                self.story_next_offset = len(stories)
+                self.story_has_more = has_more
+                self.loading = False
+            else:
+                self.loading = True
+                self.status = "Loading..."
+                self.draw_main()
+                self.stdscr.refresh()
+                stories, has_more, error = fetch_stories(feed_type, offset=0, count=INITIAL_STORY_PAGE_SIZE)
+                if error:
+                    self.stories = previous_stories
+                    self.story_has_more = previous_has_more
+                    self.story_next_offset = previous_next_offset
+                else:
+                    self.stories = stories
+                    self.story_next_offset = len(stories)
+                    self.story_has_more = has_more
+                self.loading = False
+                if not error and stories:
+                    self.store_cached_stories(feed_type, stories, has_more)
+
+        self.loading_more_stories = False
+        self.refreshing_stories = False
         self.selected = 0
         self.scroll = 0
-        self.loading = False
         self.view_state = ViewState.LIST
         self.detail_story = None
+        self.all_comments = []
         self.comments = []
         self.article_text = []
         if self.search_mode:
             self.filter_stories()
             self.status = f"Search: {len(self.filtered_stories)} results | esc: exit search | j/k: nav"
         else:
-            self.status = f"Loaded {len(self.stories)} stories | j/k: nav | o: detail | c: comments | a: article | T: translate | q: quit"
+            if force_refresh and 'error' in locals() and error:
+                self.update_list_status("Refresh failed")
+            elif (not force_refresh) and (not cached) and 'error' in locals() and error and not self.stories:
+                self.status = "Failed to load stories. Press 'r' to retry."
+            else:
+                self.update_list_status()
+        if (not force_refresh) and cached:
+            self.refresh_stories_in_background(feed_type)
+
+    def update_list_status(self, extra_msg: str = ""):
+        """Refresh list status line with pagination hint."""
+        base = f"Loaded {len(self.stories)} stories"
+        if self.story_has_more:
+            base += f" | auto-load +{STORY_LOAD_MORE_SIZE} at bottom"
+        if self.refreshing_stories:
+            base += " | refreshing..."
+        elif self.pending_story_refresh and self.pending_story_refresh["feed_type"] == self.current_feed:
+            base += " | update ready: press r"
+        base += " | j/k: nav | o: detail | c: comments | a: article | T: translate | q: quit"
+        if extra_msg:
+            base = f"{extra_msg} | " + base
+        self.status = base
+
+    def load_more_stories(self):
+        """Append the next page of stories when available."""
+        if self.loading or self.loading_more_stories or not self.story_has_more or self.search_mode:
+            return
+
+        self.loading_more_stories = True
+        self.status = f"Loading more stories ({self.story_next_offset + 1}-{self.story_next_offset + STORY_LOAD_MORE_SIZE})..."
+        self.draw_main()
+        self.stdscr.refresh()
+
+        stories, has_more, error = fetch_stories(
+            self.current_feed,
+            offset=self.story_next_offset,
+            count=STORY_LOAD_MORE_SIZE,
+        )
+        if error:
+            self.update_list_status("Load more failed")
+        elif stories:
+            existing_ids = {story.object_id for story in self.stories}
+            new_stories = [story for story in stories if story.object_id not in existing_ids]
+            if new_stories:
+                self.stories.extend(new_stories)
+            self.story_next_offset += len(stories)
+            self.story_has_more = has_more and bool(new_stories or stories)
+            self.update_list_status()
+        else:
+            self.story_has_more = False
+            self.update_list_status("No more stories available")
+
+        self.loading_more_stories = False
+
+    def maybe_load_more_stories(self):
+        """Fetch the next page when the cursor gets near the end."""
+        if self.search_mode or not self.story_has_more:
+            return
+        if self.selected >= max(0, len(self.stories) - 5):
+            self.load_more_stories()
+
+    def refresh_stories_in_background(self, feed_type="top"):
+        """Refresh the first story batch without blocking startup."""
+        if self.refreshing_stories or self.loading or self.loading_more_stories:
+            return
+
+        self.refreshing_stories = True
+        self.update_list_status()
+
+        def _refresh():
+            stories, has_more, error = fetch_stories(feed_type, offset=0, count=INITIAL_STORY_PAGE_SIZE)
+            if not error and stories:
+                self.pending_story_refresh = {
+                    "feed_type": feed_type,
+                    "stories": stories,
+                    "has_more": has_more,
+                }
+                self.store_cached_stories(feed_type, stories, has_more)
+            self.refreshing_stories = False
+            self.update_list_status()
+
+        threading.Thread(target=_refresh, daemon=True).start()
+
+    def update_comments_status(self, extra_msg: str = ""):
+        """Refresh comment status line with incremental loading hint."""
+        base = f"{len(self.comments)}/{len(self.all_comments)} comments"
+        if len(self.comments) < len(self.all_comments):
+            base += f" | auto-load +{COMMENT_LOAD_MORE_SIZE} at bottom"
+        base += " | j/k: scroll | g/G: top/bottom | esc: back | q: quit"
+        if extra_msg:
+            base = f"{extra_msg} | " + base
+        self.status = base
+
+    def load_more_comments(self):
+        """Reveal more preloaded comments for the current story."""
+        if len(self.comments) >= len(self.all_comments):
+            return
+        next_count = min(len(self.all_comments), len(self.comments) + COMMENT_LOAD_MORE_SIZE)
+        self.comments = self.all_comments[:next_count]
+        self.update_comments_status()
+
+    def maybe_load_more_comments(self):
+        """Reveal more comments when the cursor gets near the end."""
+        if self.comment_selected >= max(0, len(self.comments) - 3):
+            self.load_more_comments()
 
     def load_comments(self):
         stories_list = self.filtered_stories if self.search_mode else self.stories
@@ -460,12 +881,15 @@ class HNViewer:
         self.stdscr.refresh()
         item = fetch_comments(story_id)
         if item:
-            self.comments = flatten_comments(item)
+            self.all_comments = flatten_comments(item)
+            self.comments = self.all_comments[:INITIAL_COMMENT_BATCH_SIZE]
             self.view_state = ViewState.COMMENTS
             self.comment_selected = 0
             self.comment_scroll = 0
-            self.status = f"{len(self.comments)} comments | j/k: scroll | g/G: top/bottom | esc: back | q: quit"
+            self.update_comments_status()
         else:
+            self.all_comments = []
+            self.comments = []
             self.status = "Failed to load comments. Press 'r' to retry."
         self.loading = False
 
@@ -476,7 +900,7 @@ class HNViewer:
         self.filtered_stories = self.stories[:]
         self.selected = 0
         self.scroll = 0
-        curses.curs_set(1)
+        safe_curs_set(1)
 
     def exit_search(self):
         """Exit search input mode"""
@@ -485,7 +909,7 @@ class HNViewer:
         self.filtered_stories = []
         self.selected = 0
         self.scroll = 0
-        curses.curs_set(0)
+        safe_curs_set(0)
 
     def filter_stories(self):
         """Filter stories based on search query"""
@@ -522,7 +946,7 @@ class HNViewer:
             for line in raw_lines:
                 if not line.strip():
                     wrapped.append('')
-                elif line.startswith('#') or line.startswith('> ') or line.startswith('• '):
+                elif is_structured_article_line(line):
                     wrapped.append(line)
                 else:
                     wrapped.extend(wrap_by_width(line, content_w))
@@ -779,10 +1203,7 @@ class HNViewer:
         while idx < len(self.comments) and row < max_rows:
             c = self.comments[idx]
             depth = min(c.depth, 8)
-            if depth == 0:
-                body_indent = "│ "
-            else:
-                body_indent = "│ " * (depth + 1)
+            _, body_indent = self._comment_prefixes(c.depth)
 
             # Separator before top-level comments
             if depth == 0 and idx > 0:
@@ -794,7 +1215,7 @@ class HNViewer:
             row += 1  # header line
 
             text = strip_html(c.text)
-            body_lines = textwrap.wrap(text, width=w - len(body_indent) - 2)
+            body_lines = wrap_by_width(text, max(10, w - get_display_width(body_indent) - 2))
             row += len(body_lines)
 
             # Gap
@@ -838,20 +1259,14 @@ class HNViewer:
             author = c.author
             ago = time_ago(c.time)
             text = strip_html(c.text)
-
-            if depth == 0:
-                indent_prefix = "│ "
-                body_indent = "│ "
-            else:
-                indent_prefix = "│ " * depth
-                body_indent = "│ " * (depth + 1)
+            indent_prefix, body_indent = self._comment_prefixes(depth)
 
             row = start_row
 
             # Separator before top-level comments
             if depth == 0 and idx > 0:
                 self.stdscr.attron(curses.color_pair(8))
-                self.stdscr.addnstr(row, 0, "─" * min(w - 1, 40), w - 1)
+                self.stdscr.addnstr(row, 2, "─" * max(0, min(w - 5, 24)), w - 3)
                 self.stdscr.attroff(curses.color_pair(8))
                 row += 1
 
@@ -872,7 +1287,7 @@ class HNViewer:
 
             row += 1
 
-            body_lines = textwrap.wrap(text, width=w - len(body_indent) - 2)
+            body_lines = wrap_by_width(text, max(10, w - get_display_width(body_indent) - 2))
             for bline in body_lines:
                 if row >= h - 1:
                     break
@@ -904,7 +1319,16 @@ class HNViewer:
         box_w = w - 4
         start_y = 2
         start_x = 2
-        content_w = box_w - 5
+        content_w = max(1, box_w - 6)
+        visible_rows = max(1, box_h - 4)
+
+        all_lines = self.build_translation_popup_lines(content_w)
+        total = len(all_lines)
+        max_scroll = max(0, total - visible_rows)
+        if self.trans_scroll > max_scroll:
+            self.trans_scroll = max_scroll
+        if self.trans_scroll < 0:
+            self.trans_scroll = 0
 
         try:
             # Clear popup area
@@ -920,97 +1344,80 @@ class HNViewer:
             self.stdscr.addnstr(start_y + box_h - 1, start_x, "└" + "─" * (box_w - 2) + "┘", box_w)
             self.stdscr.attroff(curses.color_pair(8))
 
-            if self.translating:
-                # Source text (all lines)
-                source_lines = wrap_by_width(self.trans_source, content_w)
-                for i in range(len(source_lines)):
-                    ry = start_y + 1 + i
-                    if ry >= start_y + box_h - 2:
-                        break
-                    self.stdscr.addnstr(ry, start_x + 2, source_lines[i], content_w)
-
-                # Loading spinner at bottom
-                spinner = ["|", "/", "-", "\\"]
-                frame = spinner[self.trans_frame % 4]
-                load_y = start_y + box_h - 3
-                model_name = self.cfg.get("model", "unknown")
-                self.stdscr.attron(curses.color_pair(8))
-                self.stdscr.addnstr(load_y, start_x + 4, f"{model_name}: [ {frame} ] 翻译中...", box_w - 8)
-                self.stdscr.attroff(curses.color_pair(8))
-                self.trans_frame += 1
+            scroll_bar_x = start_x + box_w - 2
+            if total > visible_rows:
+                bar_h = max(1, int(visible_rows * visible_rows / total))
+                max_top = visible_rows - bar_h
+                bar_top = int(self.trans_scroll / max_scroll * max_top) if max_scroll > 0 else 0
             else:
-                # Build all lines: source + separator + model label + translation
-                all_lines = []
+                bar_h = 0
+                bar_top = 0
 
-                # Source text (all lines, no cap)
-                source_lines = wrap_by_width(self.trans_source, content_w)
-                for line in source_lines:
-                    all_lines.append(("source", line))
+            for i in range(visible_rows):
+                idx = self.trans_scroll + i
+                ry = start_y + 1 + i
+                if idx >= total or ry >= start_y + box_h - 2:
+                    break
 
-                # Separator
-                all_lines.append(("sep", ""))
+                line_type, text = all_lines[idx]
 
-                # Model label
-                model_label = f"{self.cfg.get('model', 'unknown')}:"
-                all_lines.append(("label", model_label))
-
-                # Translation result (all lines)
-                result_lines = self.trans_result.split("\n")
-                for line in result_lines:
-                    if line:
-                        all_lines.extend(("result", wl) for wl in wrap_by_width(line, content_w))
-                    else:
-                        all_lines.append(("result", ""))
-
-                # Overall scroll
-                total = len(all_lines)
-                visible = box_h - 3  # minus top border row and footer row
-                scroll_bar_x = start_x + box_w - 3
-
-                if total > visible and visible > 0:
-                    bar_h = max(1, int(visible * visible / total))
-                    max_top = visible - bar_h
-                    bar_top = int(self.trans_scroll / (total - visible) * max_top) if total > visible else 0
+                if line_type == "sep":
+                    self.stdscr.attron(curses.color_pair(8))
+                    self.stdscr.addnstr(ry, start_x, "├" + "─" * (box_w - 2) + "┤", box_w)
+                    self.stdscr.attroff(curses.color_pair(8))
+                elif line_type in ("label", "status"):
+                    self.stdscr.attron(curses.A_BOLD)
+                    self.stdscr.addnstr(ry, start_x + 2, text, content_w)
+                    self.stdscr.attroff(curses.A_BOLD)
                 else:
-                    bar_h = 0
-                    bar_top = 0
+                    self.stdscr.addnstr(ry, start_x + 2, text, content_w)
 
-                # Draw visible lines
-                for i in range(visible):
-                    idx = self.trans_scroll + i
-                    ry = start_y + 1 + i
-                    if idx >= total or ry >= start_y + box_h - 1:
-                        break
+                if bar_h > 0:
+                    self.stdscr.attron(curses.color_pair(8))
+                    self.stdscr.addnstr(ry, scroll_bar_x, "│", 1)
+                    if bar_top <= i < bar_top + bar_h:
+                        self.stdscr.addnstr(ry, scroll_bar_x, "█", 1)
+                    self.stdscr.attroff(curses.color_pair(8))
 
-                    line_type, text = all_lines[idx]
-
-                    if line_type == "sep":
-                        self.stdscr.attron(curses.color_pair(8))
-                        self.stdscr.addnstr(ry, start_x, "├" + "─" * (box_w - 2) + "┤", box_w)
-                        self.stdscr.attroff(curses.color_pair(8))
-                    elif line_type == "label":
-                        self.stdscr.attron(curses.A_BOLD)
-                        self.stdscr.addnstr(ry, start_x + 2, text, content_w)
-                        self.stdscr.attroff(curses.A_BOLD)
-                    else:
-                        self.stdscr.addnstr(ry, start_x + 2, text, content_w)
-
-                    # Scrollbar
-                    if bar_h > 0:
-                        self.stdscr.attron(curses.color_pair(8))
-                        self.stdscr.addnstr(ry, scroll_bar_x, "│", 1)
-                        if bar_top <= i < bar_top + bar_h:
-                            self.stdscr.addnstr(ry, scroll_bar_x, "█", 1)
-                        self.stdscr.attroff(curses.color_pair(8))
+            if self.translating:
+                self.trans_frame += 1
 
             # Footer
             self.stdscr.attron(curses.color_pair(8))
-            self.stdscr.addnstr(start_y + box_h - 2, start_x + 2, "Esc: 关闭  j/k: 滚动", box_w - 4)
+            footer = "Esc: 关闭  j/k: 滚动  PgUp/PgDn: 翻页  g/G: 顶部/底部"
+            self.stdscr.addnstr(start_y + box_h - 2, start_x + 2, footer, box_w - 4)
             self.stdscr.attroff(curses.color_pair(8))
 
             self.stdscr.refresh()
         except curses.error:
             pass
+
+    def build_translation_popup_lines(self, content_w: int):
+        """Build wrapped lines for the translation popup."""
+        lines = [("label", "Original")]
+        for line in wrap_by_width(self.trans_source, content_w):
+            lines.append(("source", line))
+
+        lines.append(("sep", ""))
+        model_name = self.cfg.get("model", "unknown")
+        lines.append(("label", f"Translation ({model_name})"))
+
+        if self.translating:
+            spinner = ["|", "/", "-", "\\"]
+            frame = spinner[self.trans_frame % len(spinner)]
+            lines.append(("status", f"[ {frame} ] 正在请求大模型，请稍候..."))
+        elif self.trans_result:
+            for raw_line in self.trans_result.split("\n"):
+                wrapped = wrap_by_width(raw_line, content_w)
+                if wrapped:
+                    for line in wrapped:
+                        lines.append(("result", line))
+                else:
+                    lines.append(("result", ""))
+        else:
+            lines.append(("status", "暂无翻译结果"))
+
+        return lines
 
     def draw_confirm_exit(self):
         """Draw exit confirmation overlay"""
@@ -1034,28 +1441,34 @@ class HNViewer:
         if not self.cfg.get("key") or self.cfg["key"] == "your-api-key-here":
             self.translating = False
             self.trans_result = "[错误] 请先在 ~/.hn/config.json 中配置 api_key"
-            self.trans_source = clean[:100]
+            self.trans_source = clean
             self.trans_scroll = 0
             return
 
         cache_key = get_cache_key(clean)
         if cache_key in self.cache:
-            self.translating = False
-            self.trans_result = self.cache[cache_key]
-            self.trans_source = clean[:100]
-            self.trans_scroll = 0
-            return
+            cached_result = self.cache[cache_key]
+            if is_error_text(cached_result):
+                del self.cache[cache_key]
+                save_cache(self.cache)
+            else:
+                self.translating = False
+                self.trans_result = cached_result
+                self.trans_source = clean
+                self.trans_scroll = 0
+                return
 
         self.translating = True
         self.trans_result = ""
-        self.trans_source = clean[:100]
+        self.trans_source = clean
         self.trans_scroll = 0
         self.trans_frame = 0
 
         def _translate():
             result = call_llm(self.cfg["prompt_item"].format(text=clean), self.cfg)
-            self.cache[get_cache_key(clean)] = result
-            save_cache(self.cache)
+            if not is_error_text(result):
+                self.cache[get_cache_key(clean)] = result
+                save_cache(self.cache)
             self.trans_result = result
             self.translating = False
 
@@ -1074,16 +1487,24 @@ class HNViewer:
                 _ctrl_c_pressed = False
                 if in_confirm:
                     break  # Second Ctrl+C during confirm = exit
-                if not in_translation:
-                    in_confirm = True
-                    confirm_time = time.time()
-                    self.stdscr.timeout(200)
+                in_confirm = True
+                confirm_time = time.time()
+                self.stdscr.timeout(200)
                 continue
 
             # Check confirm timeout
             if in_confirm and time.time() - confirm_time > 5:
                 in_confirm = False
                 self.stdscr.timeout(-1)
+
+            if in_confirm:
+                self.stdscr.timeout(200)
+            elif in_translation:
+                # Only animate while the LLM request is in flight. Static popups
+                # should wait for input instead of redrawing at 100 FPS.
+                self.stdscr.timeout(120 if self.translating else -1)
+            else:
+                self.stdscr.timeout(10)
 
             # Draw current view
             if self.view_state == ViewState.ARTICLE:
@@ -1103,6 +1524,13 @@ class HNViewer:
 
             key = self.stdscr.getch()
 
+            if key == 3:  # Ctrl+C from curses input
+                if in_confirm:
+                    break
+                in_confirm = True
+                confirm_time = time.time()
+                continue
+
             if in_confirm:
                 if key == ord('y') or key == ord('Y'):
                     break
@@ -1120,13 +1548,22 @@ class HNViewer:
                         self.trans_scroll -= 1
                 elif key == ord('g'):
                     self.trans_scroll = 0
-                    self.source_scroll = 0
                 elif key == ord('G'):
-                    self.trans_scroll = max(0, len(self.trans_result.split("\n")) - 20)
+                    popup_h = self.stdscr.getmaxyx()[0] - 4
+                    visible_rows = max(1, popup_h - 4)
+                    popup_w = self.stdscr.getmaxyx()[1] - 4
+                    content_w = max(1, popup_w - 6)
+                    total = len(self.build_translation_popup_lines(content_w))
+                    self.trans_scroll = max(0, total - visible_rows)
                 elif key == curses.KEY_PPAGE:
                     self.trans_scroll = max(0, self.trans_scroll - 10)
                 elif key == curses.KEY_NPAGE:
-                    self.trans_scroll += 10
+                    popup_h = self.stdscr.getmaxyx()[0] - 4
+                    visible_rows = max(1, popup_h - 4)
+                    popup_w = self.stdscr.getmaxyx()[1] - 4
+                    content_w = max(1, popup_w - 6)
+                    total = len(self.build_translation_popup_lines(content_w))
+                    self.trans_scroll = min(max(0, total - visible_rows), self.trans_scroll + 10)
                 elif key == ord('q') or key == ord('Q'):
                     break
                 continue
@@ -1136,7 +1573,7 @@ class HNViewer:
                     self.view_state = ViewState.LIST
                     self.article_text = []
                     self.article_paragraphs = []
-                    self.status = f"Loaded {len(self.stories)} stories | j/k: nav | o: detail | c: comments | a: article | T: translate | q: quit"
+                    self.update_list_status()
                 elif key == ord('j') or key == curses.KEY_DOWN:
                     if self.article_selected < len(self.article_paragraphs) - 1:
                         self.article_selected += 1
@@ -1191,11 +1628,13 @@ class HNViewer:
             elif self.view_state == ViewState.COMMENTS:
                 if key == 27 or key == ord('b'):
                     self.view_state = ViewState.LIST
+                    self.all_comments = []
                     self.comments = []
-                    self.status = f"Loaded {len(self.stories)} stories | j/k: nav | o: detail | c: comments | a: article | T: translate | q: quit"
+                    self.update_list_status()
                 elif key == ord('j') or key == curses.KEY_DOWN:
                     if self.comment_selected < len(self.comments) - 1:
                         self.comment_selected += 1
+                        self.maybe_load_more_comments()
                 elif key == ord('k') or key == curses.KEY_UP:
                     if self.comment_selected > 0:
                         self.comment_selected -= 1
@@ -1204,6 +1643,7 @@ class HNViewer:
                     self.comment_scroll = 0
                 elif key == ord('G'):
                     self.comment_selected = len(self.comments) - 1
+                    self.maybe_load_more_comments()
                 elif key == ord('t') or key == ord('T'):
                     if self.comments:
                         c = self.comments[self.comment_selected]
@@ -1230,6 +1670,7 @@ class HNViewer:
                         self.selected += 1
                         if self.selected >= self.scroll + visible_stories:
                             self.scroll += 1
+                        self.maybe_load_more_stories()
                 elif key == ord('k') or key == curses.KEY_UP:
                     if self.selected > 0:
                         self.selected -= 1
@@ -1241,8 +1682,9 @@ class HNViewer:
                 elif key == ord('G'):
                     self.selected = len(stories_list) - 1
                     self.scroll = max(0, self.selected - visible_stories + 1)
+                    self.maybe_load_more_stories()
                 elif key == ord('r') or key == ord('R'):
-                    self.load_stories(self.current_feed)
+                    self.load_stories(self.current_feed, force_refresh=True)
                 elif key == ord('1'):
                     self.load_stories("top")
                 elif key == ord('2'):
