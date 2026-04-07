@@ -9,8 +9,6 @@ import html
 import json
 import os
 import requests
-import subprocess
-import textwrap
 import time
 import re
 import threading
@@ -274,7 +272,7 @@ def format_api_error(response) -> str:
         return f"[错误] API 请求失败 ({status}): {detail}"
     return f"[错误] API 请求失败 ({status})"
 
-def call_llm(prompt: str, cfg: dict) -> str:
+def call_llm(prompt: str, cfg: dict, *, timeout=30, max_tokens=4096) -> str:
     """Call LLM API and return response text"""
     try:
         r = requests.post(
@@ -287,15 +285,15 @@ def call_llm(prompt: str, cfg: dict) -> str:
                 "model": cfg["model"],
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3,
-                "max_tokens": 4096,
+                "max_tokens": max_tokens,
             },
-            timeout=30,
+            timeout=timeout,
         )
         r.raise_for_status()
         data = r.json()
         return data["choices"][0]["message"]["content"]
     except requests.exceptions.Timeout:
-        return "[错误] 请求超时：大模型在 30 秒内没有返回结果"
+        return f"[错误] 请求超时：大模型在 {timeout} 秒内没有返回结果"
     except requests.exceptions.ConnectionError:
         return "[错误] 无法连接到 API 服务器，请检查网络或 API 地址"
     except requests.exceptions.HTTPError as e:
@@ -312,7 +310,6 @@ def call_llm(prompt: str, cfg: dict) -> str:
 class ViewState(Enum):
     """Application view states"""
     LIST = auto()
-    DETAIL = auto()
     COMMENTS = auto()
     ARTICLE = auto()
     SEARCH = auto()
@@ -433,17 +430,6 @@ def time_ago(ts):
     else:
         return f"{diff//604800}w ago"
 
-def open_url(url):
-    if not url:
-        return
-    try:
-        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except:
-        try:
-            subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except:
-            pass
-
 def strip_html(text):
     if not text:
         return ""
@@ -451,6 +437,58 @@ def strip_html(text):
     clean = html.unescape(clean)
     clean = re.sub(r'\n{3,}', '\n\n', clean)
     return clean.strip()
+
+def extract_domain(url: Optional[str]) -> str:
+    """Extract a readable domain from a URL."""
+    if not url:
+        return ""
+    try:
+        domain = url.split("//", 1)[1].split("/", 1)[0]
+        if domain.startswith("www."):
+            domain = domain[4:]
+        return domain
+    except Exception:
+        return ""
+
+def format_comment_text(text: str) -> List[str]:
+    """Preserve lightweight comment structure from HN HTML."""
+    if not text:
+        return []
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:
+        return strip_html(text).splitlines() or [""]
+
+    soup = BeautifulSoup(text, "html.parser")
+    blocks: List[str] = []
+
+    for p in soup.find_all("p"):
+        raw = p.get_text("\n", strip=True)
+        normalized = [normalize_whitespace(line) for line in raw.splitlines()]
+        normalized = [line for line in normalized if line]
+        if normalized:
+            blocks.append("\n".join(normalized))
+
+    if not blocks:
+        raw = soup.get_text("\n", strip=True)
+        normalized = [normalize_whitespace(line) for line in raw.splitlines()]
+        normalized = [line for line in normalized if line]
+        if normalized:
+            blocks.append("\n".join(normalized))
+
+    lines: List[str] = []
+    for idx, block in enumerate(blocks):
+        block_lines = block.split("\n")
+        for line in block_lines:
+            stripped = line.lstrip()
+            if stripped.startswith(">"):
+                quote = stripped.lstrip(">").strip()
+                lines.append(f"> {quote}" if quote else ">")
+            else:
+                lines.append(line)
+        if idx != len(blocks) - 1:
+            lines.append("")
+    return lines or [""]
 
 def normalize_whitespace(text):
     """Collapse repeated inline whitespace while preserving paragraph breaks."""
@@ -747,6 +785,25 @@ def build_article_translation_prompt(paragraphs):
         f"{payload}"
     )
 
+def split_article_translation_batches(paragraphs, max_chars=2800):
+    """Split article paragraphs into smaller translation batches."""
+    batches = []
+    current = []
+    current_chars = 0
+    for para in paragraphs:
+        block = f"[{para['pid']}]\n{para['text']}"
+        block_len = len(block)
+        if current and current_chars + block_len + 2 > max_chars:
+            batches.append(current)
+            current = [para]
+            current_chars = block_len
+        else:
+            current.append(para)
+            current_chars += block_len + (2 if current_chars else 0)
+    if current:
+        batches.append(current)
+    return batches
+
 def parse_labeled_article_translation(text):
     """Parse a translation response that uses [P1]-style paragraph ids."""
     parsed = {}
@@ -1017,7 +1074,6 @@ class HNViewer:
         self.current_feed = "top"
         self.view_state = ViewState.LIST
         self.search_mode = False  # True when actively typing search
-        self.detail_story: Optional[Story] = None
         self.all_comments: List[Comment] = []
         self.comments: List[Comment] = []
         self.comment_scroll = 0
@@ -1036,6 +1092,8 @@ class HNViewer:
         self.story_next_offset = 0
         self.story_has_more = False
         self.loading_more_stories = False
+        self.story_autoload_locked = False
+        self.story_last_autoload_at = 0.0
         try:
             safe_curs_set(0)
         except Exception:
@@ -1051,7 +1109,7 @@ class HNViewer:
                 curses.init_pair(3, curses.COLOR_GREEN, -1)
                 curses.init_pair(4, curses.COLOR_RED, -1)
                 curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLUE)
-                curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_WHITE)
+                curses.init_pair(6, 254, 239)
                 curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_BLUE)
                 curses.init_pair(8, curses.COLOR_WHITE, -1)
                 curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_BLACK)
@@ -1080,6 +1138,113 @@ class HNViewer:
             header_prefix = ("  " * (depth - 1)) + "└─ "
         body_prefix = " " * get_display_width(header_prefix)
         return header_prefix, body_prefix
+
+    def _draw_full_width_bar(self, y: int, text: str, attr: int):
+        """Draw a full-width bar so the background stays aligned to the edge."""
+        h, w = self.stdscr.getmaxyx()
+        if y < 0 or y >= h or w <= 0:
+            return
+        try:
+            self.stdscr.attron(attr)
+            self.stdscr.addnstr(y, 0, " " * max(0, w - 1), w - 1)
+            self.stdscr.addnstr(y, 0, text[:w - 1], w - 1)
+            self.stdscr.attroff(attr)
+        except curses.error:
+            pass
+
+    def _flush_pending_input(self):
+        """Drop buffered key / wheel events after a blocking operation."""
+        try:
+            curses.flushinp()
+        except curses.error:
+            pass
+
+    def _story_layout(self, story: Story, index: int, width: int) -> Dict[str, Any]:
+        """Build wrapped title/meta lines for one story row group."""
+        rank = f" {index + 1:>3}. "
+        title_width = max(12, width - len(rank) - 1)
+        title_lines = wrap_by_width(story.title, title_width)[:2]
+        if len(title_lines) > 1:
+            original = wrap_by_width(story.title, title_width)
+            if len(original) > 2 and title_width > 1:
+                clipped = title_lines[-1]
+                if get_display_width(clipped) >= title_width:
+                    clipped = clipped[:-1]
+                title_lines[-1] = clipped.rstrip() + "…"
+
+        domain = extract_domain(story.url)
+        meta = f"{story.points}pts | {time_ago(story.created_at)} | {story.num_comments} comments"
+        if domain:
+            meta += f" | {domain}"
+        return {
+            "rank": rank,
+            "title_lines": title_lines or [""],
+            "meta": meta,
+            "height": len(title_lines or [""]) + 1,
+        }
+
+    def _ensure_story_visible(self, stories: List[Story], width: int, height: int):
+        """Keep the selected story visible in variable-height list layout."""
+        if not stories:
+            self.scroll = 0
+            return
+        self.scroll = max(0, min(self.scroll, len(stories) - 1))
+
+        def visible_indices(start_idx: int) -> List[int]:
+            y = 2
+            visible: List[int] = []
+            idx = start_idx
+            while idx < len(stories) and y < height - 1:
+                layout = self._story_layout(stories[idx], idx, width)
+                needed_rows = layout["height"] + 1
+                if y + needed_rows > height:
+                    break
+                visible.append(idx)
+                y += needed_rows
+                idx += 1
+            return visible
+
+        visible = visible_indices(self.scroll)
+        if visible and visible[0] <= self.selected <= visible[-1]:
+            return
+
+        target = max(0, self.selected - 1)
+        while target > 0:
+            probe = visible_indices(target)
+            if probe and probe[0] <= self.selected <= probe[-1]:
+                self.scroll = target
+                return
+            target -= 1
+        self.scroll = max(0, self.selected)
+
+    def _ensure_comment_visible(self, width: int, height: int):
+        """Adjust comment scroll while preserving nearby context."""
+        visible = self._calc_comment_rows(width, height, self.comment_scroll)
+        if not visible:
+            self.comment_scroll = max(0, min(self.comment_selected, len(self.comments) - 1))
+            return
+
+        first_idx = visible[0][0]
+        last_idx = visible[-1][0]
+        if first_idx <= self.comment_selected <= last_idx:
+            return
+
+        if self.comment_selected < first_idx:
+            self.comment_scroll = max(0, self.comment_selected - 1)
+            return
+
+        target = max(0, self.comment_selected - 2)
+        while target > 0:
+            probe = self._calc_comment_rows(width, height, target)
+            if not probe:
+                break
+            probe_first = probe[0][0]
+            probe_last = probe[-1][0]
+            if probe_first <= self.comment_selected <= probe_last:
+                self.comment_scroll = target
+                return
+            target -= 1
+        self.comment_scroll = max(0, self.comment_selected)
 
     def _reset_article_state(self):
         """Clear article-specific state when leaving or reloading article mode."""
@@ -1258,6 +1423,7 @@ class HNViewer:
             self.loading = False
             if not error and stories:
                 self.store_cached_stories(feed_type, stories, has_more)
+            self._flush_pending_input()
         else:
             cached = self.get_cached_stories(feed_type)
             if cached:
@@ -1283,13 +1449,15 @@ class HNViewer:
                 self.loading = False
                 if not error and stories:
                     self.store_cached_stories(feed_type, stories, has_more)
+                self._flush_pending_input()
 
         self.loading_more_stories = False
         self.refreshing_stories = False
+        self.story_autoload_locked = False
+        self.story_last_autoload_at = 0.0
         self.selected = 0
         self.scroll = 0
         self.view_state = ViewState.LIST
-        self.detail_story = None
         self.all_comments = []
         self.comments = []
         self._reset_article_state()
@@ -1308,14 +1476,12 @@ class HNViewer:
 
     def update_list_status(self, extra_msg: str = ""):
         """Refresh list status line with pagination hint."""
-        base = f"Loaded {len(self.stories)} stories"
-        if self.story_has_more:
-            base += f" | auto-load +{STORY_LOAD_MORE_SIZE} at bottom"
+        base = f"{len(self.stories)} stories"
         if self.refreshing_stories:
             base += " | refreshing..."
         elif self.pending_story_refresh and self.pending_story_refresh["feed_type"] == self.current_feed:
-            base += " | update ready: press r"
-        base += " | j/k: nav | o: detail | c: comments | a: article | T: translate | q: quit"
+            base += " | update ready: r"
+        base += " | a article | l comments | q quit"
         if extra_msg:
             base = f"{extra_msg} | " + base
         self.status = base
@@ -1325,6 +1491,7 @@ class HNViewer:
         if self.loading or self.loading_more_stories or not self.story_has_more or self.search_mode:
             return
 
+        previous_selected = self.selected
         self.loading_more_stories = True
         self.status = f"Loading more stories ({self.story_next_offset + 1}-{self.story_next_offset + STORY_LOAD_MORE_SIZE})..."
         self.draw_main()
@@ -1349,13 +1516,38 @@ class HNViewer:
             self.story_has_more = False
             self.update_list_status("No more stories available")
 
+        # Wheel / repeated down events can accumulate while the blocking fetch
+        # is in flight. Drop that backlog so the cursor stays on the next
+        # expected item instead of jumping several rows after loading finishes.
+        self.selected = min(previous_selected, max(0, len(self.stories) - 1))
+        self._flush_pending_input()
+
         self.loading_more_stories = False
 
     def maybe_load_more_stories(self):
         """Fetch the next page when the cursor gets near the end."""
         if self.search_mode or not self.story_has_more:
             return
-        if self.selected >= max(0, len(self.stories) - 5):
+        trigger_threshold = max(0, len(self.stories) - 5)
+        release_threshold = max(0, len(self.stories) - 8)
+
+        # Require the cursor to leave the bottom trigger zone before
+        # allowing another auto-load, which prevents one wheel gesture
+        # from cascading through multiple page fetches.
+        if self.selected < release_threshold:
+            self.story_autoload_locked = False
+
+        if self.story_autoload_locked:
+            return
+
+        # Short debounce for terminals that emit multiple wheel/down events
+        # while the previous load is still settling.
+        if time.time() - self.story_last_autoload_at < 0.6:
+            return
+
+        if self.selected >= trigger_threshold:
+            self.story_autoload_locked = True
+            self.story_last_autoload_at = time.time()
             self.load_more_stories()
 
     def refresh_stories_in_background(self, feed_type="top"):
@@ -1383,9 +1575,7 @@ class HNViewer:
     def update_comments_status(self, extra_msg: str = ""):
         """Refresh comment status line with incremental loading hint."""
         base = f"{len(self.comments)}/{len(self.all_comments)} comments"
-        if len(self.comments) < len(self.all_comments):
-            base += f" | auto-load +{COMMENT_LOAD_MORE_SIZE} at bottom"
-        base += " | j/k: scroll | g/G: top/bottom | esc: back | q: quit"
+        base += " | t translate | esc back | q quit"
         if extra_msg:
             base = f"{extra_msg} | " + base
         self.status = base
@@ -1428,6 +1618,7 @@ class HNViewer:
             self.comments = []
             self.status = "Failed to load comments. Press 'r' to retry."
         self.loading = False
+        self._flush_pending_input()
 
     def enter_search(self):
         """Enter search input mode"""
@@ -1467,7 +1658,7 @@ class HNViewer:
             return
         s = stories_list[self.selected]
         if not s.url:
-            self.status = "This post has no external URL (it's a discussion post). Press 'c' for comments."
+            self.status = "This post has no external URL. Press l for comments."
             return
         self.loading = True
         self.status = f"Fetching article: {s.title[:50]}..."
@@ -1487,10 +1678,11 @@ class HNViewer:
             self.article_translation_scroll = 0
             self.start_article_translation(self.article_paragraphs)
             self.view_state = ViewState.ARTICLE
-            self.status = f"Article: {s.title[:60]} | j/k: paragraph | T: translate | g/G: top/bottom | esc: back | q: quit"
+            self.status = "Article | a article | l comments | t translate | esc back | q quit"
         else:
-            self.status = "Failed to fetch article content. Press 'c' to view comments instead."
+            self.status = "Failed to fetch article content. Press l for comments instead."
         self.loading = False
+        self._flush_pending_input()
 
     def start_article_translation(self, paragraphs):
         """Start async numbered full-article translation for the article pane."""
@@ -1504,13 +1696,19 @@ class HNViewer:
             self.article_translation_text = "[错误] 请先在 ~/.hn/config.json 中配置 api_key"
             return
 
-        cache_key = get_cache_key(f"article-v2:{clean}")
-        cached_result = self.cache.get(cache_key)
+        batches = split_article_translation_batches(paragraphs)
+        cache_key = get_cache_key(f"article-v3:{clean}")
+        legacy_cache_key = get_cache_key(f"article-v2:{clean}")
+        cached_result = self.cache.get(cache_key) or self.cache.get(legacy_cache_key)
         if cached_result:
             if is_error_text(cached_result):
-                del self.cache[cache_key]
+                if cache_key in self.cache:
+                    del self.cache[cache_key]
+                if legacy_cache_key in self.cache:
+                    del self.cache[legacy_cache_key]
                 save_cache(self.cache)
             else:
+                self.cache[cache_key] = cached_result
                 self.article_translation_text = cached_result
                 self.article_translation_map = parse_labeled_article_translation(cached_result)
                 return
@@ -1518,9 +1716,21 @@ class HNViewer:
         self.article_translation_loading = True
 
         def _translate_article():
-            result = call_llm(clean, self.cfg)
+            batch_results = []
+            for batch in batches:
+                prompt = build_article_translation_prompt(batch).strip()
+                result = call_llm(prompt, self.cfg, timeout=90, max_tokens=4096)
+                if is_error_text(result):
+                    self.article_translation_text = result
+                    self.article_translation_map = {}
+                    self.article_translation_loading = False
+                    return
+                batch_results.append(result.strip())
+
+            result = "\n\n".join(part for part in batch_results if part)
             if not is_error_text(result):
                 self.cache[cache_key] = result
+                self.cache[legacy_cache_key] = result
                 save_cache(self.cache)
             self.article_translation_text = result
             self.article_translation_map = parse_labeled_article_translation(result)
@@ -1533,23 +1743,10 @@ class HNViewer:
         h, w = self.stdscr.getmaxyx()
 
         if self.search_mode:
-            title = f" Search Stories - {len(self.filtered_stories)} results "
+            title = f" Search: {self.search_query}_ | {len(self.filtered_stories)} results "
         else:
-            title = f" Hacker News - {self.current_feed.upper()} "
-        self.stdscr.attron(curses.color_pair(6) | curses.A_BOLD)
-        self.stdscr.addnstr(0, 0, title.ljust(w), w - 1)
-        self.stdscr.attroff(curses.color_pair(6) | curses.A_BOLD)
-
-        if self.search_mode:
-            menu = f" Search: {self.search_query}_ "
-            self.stdscr.attron(curses.color_pair(4))
-            self.stdscr.addnstr(1, 0, menu.ljust(w)[:w-1], w - 1)
-            self.stdscr.attroff(curses.color_pair(4))
-        else:
-            menu = " [1]Top [2]Ask | [r]刷新 [/]搜索 "
-            self.stdscr.attron(curses.color_pair(6))
-            self.stdscr.addnstr(1, 0, menu.ljust(w), w - 1)
-            self.stdscr.attroff(curses.color_pair(6))
+            title = f" Hacker News - {self.current_feed.upper()} | [1] Top [2] Ask | [r] Refresh [/] Search [t] Translate "
+        self._draw_full_width_bar(0, title, curses.color_pair(6) | curses.A_BOLD)
 
         if self.loading:
             self.stdscr.addnstr(h // 2, w // 2 - 10, "Loading...", w - 1)
@@ -1562,100 +1759,77 @@ class HNViewer:
             return
 
         stories_to_show = self.filtered_stories if self.search_mode else self.stories
-        visible = (h - 3) // 2  # Each story takes 2 rows
-        for i in range(visible):
-            idx = self.scroll + i
-            if idx >= len(stories_to_show):
-                break
+        self._ensure_story_visible(stories_to_show, w, h)
+        y = 1
+        idx = self.scroll
+        while idx < len(stories_to_show) and y < h - 1:
             s = stories_to_show[idx]
-            title_text = s.title
-            score = s.points
-            comments = s.num_comments
-            ago = time_ago(s.created_at)
-            domain = ""
-            if s.url:
-                try:
-                    domain = s.url.split("//")[1].split("/")[0]
-                except:
-                    pass
+            layout = self._story_layout(s, idx, w)
+            needed_rows = layout["height"] + 1
+            if y + needed_rows > h:
+                break
 
-            line_num = i * 2 + 2  # Line 2, 4, 6, ...
-            meta_line = line_num + 1
+            is_selected = idx == self.selected
+            rank = layout["rank"]
+            title_lines = layout["title_lines"]
+            meta = layout["meta"]
 
-            # Meta line (without author)
-            meta = f"     {score}pts | {ago} | {comments} comments"
-            if domain:
-                meta += f" | {domain}"
+            if is_selected:
+                row = y
+                for line_no, title_line in enumerate(title_lines):
+                    if row >= h - 1:
+                        break
+                    self.stdscr.attron(curses.color_pair(7))
+                    self.stdscr.addnstr(row, 0, " ".ljust(w - 1), w - 1)
+                    self.stdscr.attroff(curses.color_pair(7))
+                    if line_no == 0:
+                        self.stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
+                        self.stdscr.addnstr(row, 0, rank, w - 1)
+                        self.stdscr.addnstr(row, len(rank), title_line, w - len(rank) - 1)
+                        self.stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
+                    else:
+                        indent = " " * len(rank)
+                        self.stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
+                        self.stdscr.addnstr(row, 0, indent, w - 1)
+                        self.stdscr.addnstr(row, len(rank), title_line, w - len(rank) - 1)
+                        self.stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
+                    row += 1
 
-            if idx == self.selected:
-                title_full = f" {idx+1:>3}. {title_text}"
-                if meta_line < h - 1:
-                    self.stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
-                    self.stdscr.addnstr(line_num, 0, title_full.ljust(w - 1), w - 1)
-                    self.stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
-                    self.stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
-                    self.stdscr.addnstr(meta_line, 0, meta.ljust(w - 1), w - 1)
-                    self.stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
+                if row < h - 1:
+                    self.stdscr.attron(curses.color_pair(7))
+                    self.stdscr.addnstr(row, 0, " ".ljust(w - 1), w - 1)
+                    self.stdscr.attroff(curses.color_pair(7))
+                    self.stdscr.attron(curses.color_pair(7))
+                    self.stdscr.addnstr(row, len(rank), meta, w - len(rank) - 1)
+                    self.stdscr.attroff(curses.color_pair(7))
             else:
-                # Unselected: cyan number + default title
-                num_str = f" {idx+1:>3}. "
-                self.stdscr.attron(curses.color_pair(1))
-                self.stdscr.addnstr(line_num, 0, num_str, w - 1)
-                self.stdscr.attroff(curses.color_pair(1))
-                self.stdscr.addnstr(line_num, len(num_str), title_text, w - len(num_str) - 1)
+                row = y
+                for line_no, title_line in enumerate(title_lines):
+                    if row >= h - 1:
+                        break
+                    if line_no == 0:
+                        self.stdscr.attron(curses.color_pair(1))
+                        self.stdscr.addnstr(row, 0, rank, w - 1)
+                        self.stdscr.attroff(curses.color_pair(1))
+                    else:
+                        self.stdscr.addnstr(row, 0, " " * len(rank), w - 1)
+                    if line_no == 0:
+                        self.stdscr.attron(curses.A_BOLD)
+                    self.stdscr.addnstr(row, len(rank), title_line, w - len(rank) - 1)
+                    if line_no == 0:
+                        self.stdscr.attroff(curses.A_BOLD)
+                    row += 1
 
-                # Meta line in green
-                if meta_line < h - 1:
+                if row < h - 1:
                     self.stdscr.attron(curses.color_pair(3))
-                    self.stdscr.addnstr(meta_line, 0, meta[:w-1], w - 1)
+                    self.stdscr.addnstr(row, len(rank), meta, w - len(rank) - 1)
                     self.stdscr.attroff(curses.color_pair(3))
 
-        self.stdscr.attron(curses.color_pair(6))
+            y += needed_rows
+            idx += 1
+
         status_line = f" {self.status} "
-        self.stdscr.addnstr(h - 1, 0, status_line.ljust(w), w - 1)
-        self.stdscr.attroff(curses.color_pair(6))
-
-        self.stdscr.refresh()
-
-    def draw_detail(self):
-        self.stdscr.erase()
-        h, w = self.stdscr.getmaxyx()
-        s = self.detail_story
-        if not s:
-            return
-
-        title = f" {s.title} "
-        self.stdscr.attron(curses.color_pair(6) | curses.A_BOLD)
-        self.stdscr.addnstr(0, 0, title.ljust(w), w - 1)
-        self.stdscr.attroff(curses.color_pair(6) | curses.A_BOLD)
-
-        meta = f"  by {s.author} | {s.points} pts | {time_ago(s.created_at)} | {s.num_comments} comments"
-        self.stdscr.attron(curses.color_pair(2))
-        self.stdscr.addnstr(1, 0, meta, w - 1)
-        self.stdscr.attroff(curses.color_pair(2))
-
-        if s.url:
-            url_line = f"  URL: {s.url}"
-            self.stdscr.attron(curses.color_pair(1))
-            self.stdscr.addnstr(2, 0, url_line, w - 1)
-            self.stdscr.attroff(curses.color_pair(1))
-            start = 3
-        else:
-            start = 2
-
-        # Self-posts have text content
-        text = getattr(s, 'text', None)
-        if text:
-            clean = strip_html(text)
-            lines = textwrap.wrap(clean, width=w - 4)
-            for i, line in enumerate(lines):
-                if start + i < h - 2:
-                    self.stdscr.addnstr(start + i, 2, line, w - 3)
-
-        self.stdscr.attron(curses.color_pair(6))
-        footer = " Press 'o' to open in browser | 'esc' to go back | 'q' to quit "
-        self.stdscr.addnstr(h - 1, 0, footer.ljust(w), w - 1)
-        self.stdscr.attroff(curses.color_pair(6))
+        self._draw_full_width_bar(h - 1, status_line, curses.color_pair(6))
 
         self.stdscr.refresh()
 
@@ -1672,9 +1846,7 @@ class HNViewer:
         stories_list = self.filtered_stories if self.search_mode else self.stories
         story_title = stories_list[self.selected].title[:w - 4] if stories_list else "Unknown"
         title = f" Article: {story_title} "
-        self.stdscr.attron(curses.color_pair(6) | curses.A_BOLD)
-        self.stdscr.addnstr(0, 0, title.ljust(w), w - 1)
-        self.stdscr.attroff(curses.color_pair(6) | curses.A_BOLD)
+        self._draw_full_width_bar(0, title, curses.color_pair(6) | curses.A_BOLD)
 
         content_w = w - 4
         body_rows = max(4, h - 2)
@@ -1763,10 +1935,8 @@ class HNViewer:
             self.stdscr.addnstr(trans_start_y, 2, "暂无全文翻译", content_w)
             self.stdscr.attroff(curses.color_pair(8))
 
-        self.stdscr.attron(curses.color_pair(6))
         status_line = f" {self.status} "
-        self.stdscr.addnstr(h - 1, 0, status_line.ljust(w), w - 1)
-        self.stdscr.attroff(curses.color_pair(6))
+        self._draw_full_width_bar(h - 1, status_line, curses.color_pair(6))
 
         self.stdscr.refresh()
 
@@ -1791,8 +1961,14 @@ class HNViewer:
             start_row = row
             row += 1  # header line
 
-            text = strip_html(c.text)
-            body_lines = wrap_by_width(text, max(10, w - get_display_width(body_indent) - 2))
+            comment_lines = format_comment_text(c.text)
+            body_width = max(10, w - get_display_width(body_indent) - 2)
+            body_lines = []
+            for raw_line in comment_lines:
+                if not raw_line.strip():
+                    body_lines.append("")
+                else:
+                    body_lines.extend(wrap_by_width(raw_line, body_width))
             row += len(body_lines)
 
             # Gap
@@ -1816,17 +1992,15 @@ class HNViewer:
         stories_list = self.filtered_stories if self.search_mode else self.stories
         story_title = stories_list[self.selected].title[:w - 4] if stories_list else "Unknown"
         title = f" Comments: {story_title} "
-        self.stdscr.attron(curses.color_pair(6) | curses.A_BOLD)
-        self.stdscr.addnstr(0, 0, title.ljust(w), w - 1)
-        self.stdscr.attroff(curses.color_pair(6) | curses.A_BOLD)
+        self._draw_full_width_bar(0, title, curses.color_pair(6) | curses.A_BOLD)
 
         # Ensure selected comment is visible
+        self._ensure_comment_visible(w, h)
         visible = self._calc_comment_rows(w, h, self.comment_scroll)
         if visible:
             vis_indices = [v[0] for v in visible]
             if self.comment_selected not in vis_indices:
-                # Scroll to make selected comment visible
-                self.comment_scroll = self.comment_selected
+                self._ensure_comment_visible(w, h)
                 visible = self._calc_comment_rows(w, h, self.comment_scroll)
 
         # Render visible comments
@@ -1835,7 +2009,6 @@ class HNViewer:
             depth = min(c.depth, 8)
             author = c.author
             ago = time_ago(c.time)
-            text = strip_html(c.text)
             indent_prefix, body_indent = self._comment_prefixes(depth)
 
             row = start_row
@@ -1864,7 +2037,13 @@ class HNViewer:
 
             row += 1
 
-            body_lines = wrap_by_width(text, max(10, w - get_display_width(body_indent) - 2))
+            body_width = max(10, w - get_display_width(body_indent) - 2)
+            body_lines = []
+            for raw_line in format_comment_text(c.text):
+                if not raw_line.strip():
+                    body_lines.append("")
+                else:
+                    body_lines.extend(wrap_by_width(raw_line, body_width))
             for bline in body_lines:
                 if row >= h - 1:
                     break
@@ -1872,7 +2051,11 @@ class HNViewer:
                     self.stdscr.attron(curses.color_pair(5))
                     self.stdscr.addnstr(row, 0, body_indent.ljust(w - 1), w - 1)
                     self.stdscr.attroff(curses.color_pair(5))
-                    if looks_like_url_text(bline) or contains_url(bline):
+                    if bline.startswith("> "):
+                        self.stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
+                        self.stdscr.addnstr(row, len(body_indent), bline, w - len(body_indent) - 1)
+                        self.stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
+                    elif looks_like_url_text(bline) or contains_url(bline):
                         render_text_with_urls(
                             self.stdscr,
                             row,
@@ -1890,7 +2073,11 @@ class HNViewer:
                     self.stdscr.attron(curses.color_pair(8))
                     self.stdscr.addnstr(row, 0, body_indent, w - 1)
                     self.stdscr.attroff(curses.color_pair(8))
-                    if looks_like_url_text(bline) or contains_url(bline):
+                    if bline.startswith("> "):
+                        self.stdscr.attron(curses.color_pair(10))
+                        self.stdscr.addnstr(row, len(body_indent), bline, w - len(body_indent) - 1)
+                        self.stdscr.attroff(curses.color_pair(10))
+                    elif looks_like_url_text(bline) or contains_url(bline):
                         render_text_with_urls(
                             self.stdscr,
                             row,
@@ -1904,10 +2091,8 @@ class HNViewer:
                         self.stdscr.addnstr(row, len(body_indent), bline, w - len(body_indent) - 1)
                 row += 1
 
-        self.stdscr.attron(curses.color_pair(6))
         status_line = f" {self.status} "
-        self.stdscr.addnstr(h - 1, 0, status_line.ljust(w), w - 1)
-        self.stdscr.attroff(curses.color_pair(6))
+        self._draw_full_width_bar(h - 1, status_line, curses.color_pair(6))
 
         self.stdscr.refresh()
 
@@ -1993,13 +2178,11 @@ class HNViewer:
 
     def build_translation_popup_lines(self, content_w: int):
         """Build wrapped lines for the translation popup."""
-        lines = [("label", "Original")]
+        lines = []
         for line in wrap_by_width(self.trans_source, content_w):
             lines.append(("source", line))
 
         lines.append(("sep", ""))
-        model_name = self.cfg.get("model", "unknown")
-        lines.append(("label", f"Translation ({model_name})"))
 
         if self.translating:
             spinner = ["|", "/", "-", "\\"]
@@ -2110,8 +2293,6 @@ class HNViewer:
                 self.draw_article()
             elif self.view_state == ViewState.COMMENTS:
                 self.draw_comments()
-            elif self.view_state == ViewState.DETAIL:
-                self.draw_detail()
             else:
                 self.draw_main()
 
@@ -2199,7 +2380,6 @@ class HNViewer:
                     break
             elif self.search_mode:
                 stories_list = self.filtered_stories
-                visible_stories = (self.stdscr.getmaxyx()[0] - 3) // 2
                 if key == 27:  # ESC
                     self.exit_search()
                 elif key == 10 or key == curses.KEY_ENTER:  # Enter
@@ -2211,19 +2391,15 @@ class HNViewer:
                 elif key == ord('j') or key == curses.KEY_DOWN:
                     if self.selected < len(stories_list) - 1:
                         self.selected += 1
-                        if self.selected >= self.scroll + visible_stories:
-                            self.scroll += 1
                 elif key == ord('k') or key == curses.KEY_UP:
                     if self.selected > 0:
                         self.selected -= 1
-                        if self.selected < self.scroll:
-                            self.scroll -= 1
                 elif key == ord('g'):
                     self.selected = 0
                     self.scroll = 0
                 elif key == ord('G'):
                     self.selected = len(stories_list) - 1
-                    self.scroll = max(0, self.selected - visible_stories + 1)
+                    self.scroll = max(0, self.selected)
                 elif key == curses.KEY_LEFT:
                     pass  # Ignore cursor movement in search
                 elif key == curses.KEY_RIGHT:
@@ -2257,37 +2433,23 @@ class HNViewer:
                         in_translation = True
                 elif key == ord('q') or key == ord('Q'):
                     break
-            elif self.view_state == ViewState.DETAIL:
-                if key == 27 or key == ord('b'):
-                    self.view_state = ViewState.LIST
-                    self.detail_story = None
-                elif key == ord('o') or key == ord('O'):
-                    if self.detail_story:
-                        open_url(self.detail_story.url or self.detail_story.hn_url)
-                elif key == ord('q') or key == ord('Q'):
-                    break
             else:  # LIST view
                 stories_list = self.filtered_stories if self.search_mode else self.stories
-                visible_stories = (self.stdscr.getmaxyx()[0] - 3) // 2
                 if key == ord('q') or key == ord('Q'):
                     break
                 elif key == ord('j') or key == curses.KEY_DOWN:
                     if self.selected < len(stories_list) - 1:
                         self.selected += 1
-                        if self.selected >= self.scroll + visible_stories:
-                            self.scroll += 1
                         self.maybe_load_more_stories()
                 elif key == ord('k') or key == curses.KEY_UP:
                     if self.selected > 0:
                         self.selected -= 1
-                        if self.selected < self.scroll:
-                            self.scroll -= 1
                 elif key == ord('g'):
                     self.selected = 0
                     self.scroll = 0
                 elif key == ord('G'):
                     self.selected = len(stories_list) - 1
-                    self.scroll = max(0, self.selected - visible_stories + 1)
+                    self.scroll = max(0, self.selected)
                     self.maybe_load_more_stories()
                 elif key == ord('r') or key == ord('R'):
                     self.load_stories(self.current_feed, force_refresh=True)
@@ -2295,20 +2457,10 @@ class HNViewer:
                     self.load_stories("top")
                 elif key == ord('2'):
                     self.load_stories("ask")
-                elif key == ord('o') or key == ord('O') or key == ord('\n') or key == curses.KEY_RIGHT:
-                    stories_list = self.filtered_stories if self.search_mode else self.stories
-                    if stories_list:
-                        self.detail_story = stories_list[self.selected]
-                        self.view_state = ViewState.DETAIL
-                elif key == ord('c') or key == ord('C'):
+                elif key == ord('l') or key == ord('L'):
                     self.load_comments()
                 elif key == ord('a') or key == ord('A'):
                     self.load_article()
-                elif key == ord('u') or key == ord('U'):
-                    stories_list = self.filtered_stories if self.search_mode else self.stories
-                    if stories_list:
-                        s = stories_list[self.selected]
-                        open_url(s.url or s.hn_url)
                 elif key == ord('/'):
                     self.enter_search()
                 elif key == ord('t') or key == ord('T'):
