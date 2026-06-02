@@ -1411,32 +1411,45 @@ class HNViewer:
         }
         save_stories_cache(self.stories_cache)
 
-    def load_stories(self, feed_type="top", force_refresh=False):
-        self.current_feed = feed_type
-        cached = None
+    def _fetch_initial_batch(self, feed_type, status_text):
+        """Blocking fetch of the first story page.
+
+        Renders a loading status while the request is in flight, keeps the
+        existing list intact on failure, and caches the snapshot on success.
+        Returns the error string (or None).
+        """
         previous_stories = list(self.stories)
         previous_has_more = self.story_has_more
         previous_next_offset = self.story_next_offset
+
+        self.loading = True
+        self.status = status_text
+        self.draw_main()
+        self.stdscr.refresh()
+
+        stories, has_more, error = fetch_stories(feed_type, offset=0, count=INITIAL_STORY_PAGE_SIZE)
+        if error:
+            self.stories = previous_stories
+            self.story_has_more = previous_has_more
+            self.story_next_offset = previous_next_offset
+        else:
+            self.stories = stories
+            self.story_next_offset = len(stories)
+            self.story_has_more = has_more
+            if stories:
+                self.store_cached_stories(feed_type, stories, has_more)
+        self.loading = False
+        self._flush_pending_input()
+        return error
+
+    def load_stories(self, feed_type="top", force_refresh=False):
+        self.current_feed = feed_type
+        cached = None
+        error = None
         if force_refresh:
             if self.pending_story_refresh and self.pending_story_refresh["feed_type"] == feed_type:
                 self.pending_story_refresh = None
-            self.loading = True
-            self.status = "Refreshing..."
-            self.draw_main()
-            self.stdscr.refresh()
-            stories, has_more, error = fetch_stories(feed_type, offset=0, count=INITIAL_STORY_PAGE_SIZE)
-            if error:
-                self.stories = previous_stories
-                self.story_has_more = previous_has_more
-                self.story_next_offset = previous_next_offset
-            else:
-                self.stories = stories
-                self.story_next_offset = len(stories)
-                self.story_has_more = has_more
-            self.loading = False
-            if not error and stories:
-                self.store_cached_stories(feed_type, stories, has_more)
-            self._flush_pending_input()
+            error = self._fetch_initial_batch(feed_type, "Refreshing...")
         else:
             cached = self.get_cached_stories(feed_type)
             if cached:
@@ -1446,23 +1459,7 @@ class HNViewer:
                 self.story_has_more = has_more
                 self.loading = False
             else:
-                self.loading = True
-                self.status = "Loading..."
-                self.draw_main()
-                self.stdscr.refresh()
-                stories, has_more, error = fetch_stories(feed_type, offset=0, count=INITIAL_STORY_PAGE_SIZE)
-                if error:
-                    self.stories = previous_stories
-                    self.story_has_more = previous_has_more
-                    self.story_next_offset = previous_next_offset
-                else:
-                    self.stories = stories
-                    self.story_next_offset = len(stories)
-                    self.story_has_more = has_more
-                self.loading = False
-                if not error and stories:
-                    self.store_cached_stories(feed_type, stories, has_more)
-                self._flush_pending_input()
+                error = self._fetch_initial_batch(feed_type, "Loading...")
 
         self.loading_more_stories = False
         self.refreshing_stories = False
@@ -1478,9 +1475,9 @@ class HNViewer:
             self.filter_stories()
             self.status = f"Search: {len(self.filtered_stories)} results | esc: exit search | j/k: nav"
         else:
-            if force_refresh and 'error' in locals() and error:
+            if force_refresh and error:
                 self.update_list_status("Refresh failed")
-            elif (not force_refresh) and (not cached) and 'error' in locals() and error and not self.stories:
+            elif (not force_refresh) and (not cached) and error and not self.stories:
                 self.status = "Failed to load stories. Press 'r' to retry."
             else:
                 self.update_list_status()
