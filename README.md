@@ -123,10 +123,12 @@ hn
 {
   "api_url": "https://api.deepseek.com/v1/chat/completions",
   "api_key": "sk-your-key-here",
-  "api_model": "deepseek-chat",
+  "api_model": "deepseek-v4-flash",
   "prompt_item": "翻译提示词模板（{text} 会被替换为待翻译的正文 / 评论 / 段落）"
 }
 ```
+
+> 默认 `api_model` 用 DeepSeek 当前的 `deepseek-v4-flash`；旧的 `deepseek-chat` 将于 2026-07-24 停用。换其它 OpenAI 兼容服务时，改 `api_url` / `api_model` / `api_key` 即可。
 
 支持任何 OpenAI 兼容 API，例如：
 

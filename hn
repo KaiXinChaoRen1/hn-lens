@@ -153,7 +153,7 @@ STORIES_CACHE_TTL = 180
 DEFAULT_CONFIG = {
     "api_url": "https://api.deepseek.com/v1/chat/completions",
     "api_key": "your-api-key-here",
-    "api_model": "deepseek-chat",
+    "api_model": "deepseek-v4-flash",
     "prompt_item": "你是一个专业的中英翻译助手。请将以下英文内容翻译成流畅的中文，保留原文的格式和结构。内容：\n\n{text}",
 }
 
