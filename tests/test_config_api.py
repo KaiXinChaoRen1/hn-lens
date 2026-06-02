@@ -25,7 +25,6 @@ class LoadConfigTests(unittest.TestCase):
             "api_url": "https://api.test/v1",
             "api_key": "sk-123",
             "api_model": "test-model",
-            "prompt_word": "{word}",
             "prompt_item": "{text}",
         }
         with mock.patch.object(mod, "ensure_config", return_value=raw):
@@ -33,6 +32,7 @@ class LoadConfigTests(unittest.TestCase):
         self.assertEqual(cfg["url"], "https://api.test/v1")
         self.assertEqual(cfg["key"], "sk-123")
         self.assertEqual(cfg["model"], "test-model")
+        self.assertEqual(cfg["prompt_item"], "{text}")
 
     def test_missing_fields_fall_back_to_defaults(self):
         with mock.patch.object(mod, "ensure_config", return_value={}):

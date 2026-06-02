@@ -74,7 +74,6 @@ class HNViewerTests(unittest.TestCase):
                     "url": "https://example.com",
                     "key": "test-key",
                     "model": "test-model",
-                    "prompt_word": "{word}",
                     "prompt_item": "{text}",
                 },
             ),
@@ -162,7 +161,7 @@ class HNViewerTests(unittest.TestCase):
         # The pane and the `T` popup must hit the same cache entry so a
         # paragraph translated one way shows up instantly the other way.
         viewer = self.make_viewer()
-        viewer.article_paragraphs = [{"pid": "P1", "text": "hello article"}]
+        viewer.article_paragraphs = [{"text": "hello article"}]
         viewer.article_selected = 0
         self.assertEqual(
             viewer._selected_paragraph_key(),
@@ -172,7 +171,7 @@ class HNViewerTests(unittest.TestCase):
     def test_open_pane_translates_selected_paragraph_and_caches(self):
         viewer = self.make_viewer()
         viewer.article_pane_open = True
-        viewer.article_paragraphs = [{"pid": "P1", "text": "hello article"}]
+        viewer.article_paragraphs = [{"text": "hello article"}]
         viewer.article_selected = 0
         key = self.mod.get_cache_key("hello article")
 
@@ -188,7 +187,7 @@ class HNViewerTests(unittest.TestCase):
     def test_closed_pane_does_not_translate(self):
         viewer = self.make_viewer()
         viewer.article_pane_open = False
-        viewer.article_paragraphs = [{"pid": "P1", "text": "hello article"}]
+        viewer.article_paragraphs = [{"text": "hello article"}]
         viewer.article_selected = 0
 
         with mock.patch.object(self.mod, "call_llm") as llm, mock.patch.object(
@@ -201,7 +200,7 @@ class HNViewerTests(unittest.TestCase):
     def test_pane_translation_error_is_surfaced_but_not_cached(self):
         viewer = self.make_viewer()
         viewer.article_pane_open = True
-        viewer.article_paragraphs = [{"pid": "P1", "text": "hello article"}]
+        viewer.article_paragraphs = [{"text": "hello article"}]
         viewer.article_selected = 0
         key = self.mod.get_cache_key("hello article")
 

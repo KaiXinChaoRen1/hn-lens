@@ -139,23 +139,23 @@ class PrepareArticleLinesTests(unittest.TestCase):
         self.assertEqual(out[0], "[link] https://example.com/path")
 
 
-class ParagraphLabelingTests(unittest.TestCase):
-    def test_labels_are_sequential(self):
-        labeled = mod.label_article_paragraphs([{"text": "a"}, {"text": "b"}])
-        self.assertEqual([p["pid"] for p in labeled], ["P1", "P2"])
-
+class ParagraphDisplayTests(unittest.TestCase):
     def test_build_display_lines_tracks_start_and_end(self):
-        labeled = mod.label_article_paragraphs([{"text": "line one\nline two"}, {"text": "solo"}])
-        lines, rendered = mod.build_article_display_lines(labeled)
-        self.assertIn("[P1]", lines)
+        paras = [{"text": "line one\nline two"}, {"text": "solo"}]
+        lines, rendered = mod.build_article_display_lines(paras)
         first = rendered[0]
-        self.assertEqual(lines[first["start"]], "[P1]")
-        # start..end span covers the marker plus its text lines
-        self.assertEqual(first["end"] - first["start"], 2)
+        # start points at the first text line (no [P1] marker any more)
+        self.assertEqual(lines[first["start"]], "line one")
+        self.assertEqual(lines[first["end"]], "line two")
+        self.assertEqual(first["end"] - first["start"], 1)
+
+    def test_paragraphs_separated_by_single_blank_line(self):
+        lines, rendered = mod.build_article_display_lines([{"text": "a"}, {"text": "b"}])
+        # one blank line sits between the two paragraphs, none trails the end
+        self.assertEqual(lines, ["a", "", "b"])
 
     def test_display_lines_do_not_end_on_blank(self):
-        labeled = mod.label_article_paragraphs([{"text": "only"}])
-        lines, _ = mod.build_article_display_lines(labeled)
+        lines, _ = mod.build_article_display_lines([{"text": "only"}])
         self.assertTrue(lines[-1].strip())
 
 
