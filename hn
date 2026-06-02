@@ -1220,7 +1220,7 @@ class HNViewer:
             idx = start_idx
             while idx < len(stories) and y < height - 1:
                 layout = self._story_layout(stories[idx], idx, width)
-                needed_rows = layout["height"] + 1
+                needed_rows = layout["height"]
                 if y + needed_rows > height:
                     break
                 visible.append(idx)
@@ -1768,7 +1768,7 @@ class HNViewer:
         while idx < len(stories_to_show) and y < h - 1:
             s = stories_to_show[idx]
             layout = self._story_layout(s, idx, w)
-            needed_rows = layout["height"] + 1
+            needed_rows = layout["height"]
             if y + needed_rows > h:
                 break
 
