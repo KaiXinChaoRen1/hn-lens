@@ -223,6 +223,18 @@ class HNViewerTests(unittest.TestCase):
         self.assertIn("# Headline", joined)
         self.assertIn("Real article paragraph starts here", joined)
 
+    def test_short_lowercase_opening_sentence_is_not_filtered_as_byline(self):
+        # Regression: re.IGNORECASE used to defeat the byline pattern's
+        # capitalization anchor, silently dropping real opening sentences.
+        self.assertFalse(self.mod.is_noise_article_block(["this changes everything"], 0))
+        self.assertFalse(self.mod.is_noise_article_block(["The cat sat on the mat today"], 0))
+
+    def test_real_bylines_and_timestamps_are_still_filtered(self):
+        self.assertTrue(self.mod.is_noise_article_block(["Sofia Ferreira Santos"], 0))
+        self.assertTrue(self.mod.is_noise_article_block(["By Jane Doe"], 0))
+        self.assertTrue(self.mod.is_noise_article_block(["8 hours ago"], 0))
+        self.assertTrue(self.mod.is_noise_article_block(["Updated 3 days ago"], 1))
+
     def test_prepare_article_lines_wraps_list_items_cleanly(self):
         text = "• This is a long bullet point that should wrap onto the next line without losing its visual structure."
 

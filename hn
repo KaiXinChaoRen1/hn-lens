@@ -604,6 +604,21 @@ def classify_article_block(block):
         return "table"
     return "paragraph"
 
+def looks_like_byline(text):
+    """Whether a short top-of-page line looks like an author byline.
+
+    Bylines are capitalized and brief (e.g. "Sofia Ferreira Santos",
+    "By Jane Doe"). This intentionally stays case-sensitive so that ordinary
+    lowercase opening sentences are not mistaken for an author name.
+    """
+    candidate = re.sub(r'^by\s+', '', text.strip(), flags=re.IGNORECASE)
+    if not candidate:
+        return False
+    words = candidate.split()
+    if not (1 <= len(words) <= 4):
+        return False
+    return all(re.fullmatch(r"[A-Z][A-Za-z.\-']*", word) for word in words)
+
 def is_noise_article_block(block, index):
     """Heuristic filter for metadata and article-adjacent noise."""
     text = normalize_whitespace(" ".join(block))
@@ -612,13 +627,10 @@ def is_noise_article_block(block, index):
         return True
 
     short_block = len(text) <= 140 and len(block) <= 3
-    top_metadata_patterns = (
-        r'^\d+\s+(seconds?|minutes?|hours?|days?|weeks?)\s+ago$',
-        r'^(updated\s+)?\d+\s+(seconds?|minutes?|hours?|days?|weeks?)\s+ago$',
-        r'^(by\s+)?[A-Z][A-Za-z.\-\' ]{2,40}$',
-    )
+    # The "ago" timestamp may carry an "updated" prefix; one pattern covers both.
+    time_ago_pattern = r'^(updated\s+)?\d+\s+(seconds?|minutes?|hours?|days?|weeks?)\s+ago$'
     if index <= 2 and short_block:
-        if any(re.match(pattern, text, re.IGNORECASE) for pattern in top_metadata_patterns):
+        if re.match(time_ago_pattern, text, re.IGNORECASE) or looks_like_byline(text):
             return True
 
     noise_keywords = (
