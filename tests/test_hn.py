@@ -223,6 +223,7 @@ class HNViewerTests(unittest.TestCase):
 
         class FakeResponse:
             text = html
+            headers = {"Content-Type": "text/html; charset=utf-8"}
 
             def raise_for_status(self):
                 return None
@@ -239,8 +240,9 @@ class HNViewerTests(unittest.TestCase):
         with mock.patch.object(self.mod.requests, "get", return_value=FakeResponse()), mock.patch.dict(
             sys.modules, {"readability": fake_readability}
         ):
-            extracted = self.mod.fetch_article_text("https://example.com/article")
+            extracted, error = self.mod.fetch_article_text("https://example.com/article")
 
+        self.assertIsNone(error)
         self.assertIn("Important article sentence.", extracted)
         self.assertNotIn("FILLERMARKER", extracted)
 

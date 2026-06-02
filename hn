@@ -772,13 +772,67 @@ def adjust_article_scroll_for_selection(current_scroll, selected_para, visible_r
 
     return view_start
 
+ARTICLE_CHAR_LIMIT = 10000
+
+def truncate_article_text(text):
+    """Cap article length, marking the cut so truncation isn't silent.
+
+    Long pages used to be sliced mid-sentence with no indication; the marker
+    tells the reader the rest exists rather than quietly dropping it.
+    """
+    if len(text) <= ARTICLE_CHAR_LIMIT:
+        return text
+    return text[:ARTICLE_CHAR_LIMIT].rstrip() + "\n\n…（正文过长，已截断）"
+
+def attr_keyword_hit(attrs, keywords):
+    """Whether any keyword appears in a node's lowercased attribute blob.
+
+    Short keywords (<=3 chars, e.g. 'ad', 'nav') must sit on a word boundary;
+    matching them as bare substrings would hit header/reading/thread/headline
+    and wrongly delete real article text. Longer keywords match as substrings
+    so 'advert' still catches 'advertisement' and 'comment' catches 'comments'.
+    """
+    for kw in keywords:
+        if len(kw) <= 3:
+            if re.search(rf'(?<![a-z0-9]){re.escape(kw)}(?![a-z0-9])', attrs):
+                return True
+        elif kw in attrs:
+            return True
+    return False
+
 def fetch_article_text(url):
-    """Fetch article content and convert HTML to structured plain text"""
+    """Fetch an article and convert HTML to structured plain text.
+
+    Returns (text, error). On success error is None; on failure text is None
+    and error is a short human-readable reason (shown in the status bar) so a
+    failed open is diagnosable instead of a generic "failed" — we never want a
+    silently-swallowed exception here.
+    """
     if not url:
-        return None
+        return None, "没有可打开的 URL"
     try:
-        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"})
+        # A realistic browser header set; a bare UA gets 403'd by many sites.
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+        }
+        r = requests.get(url, timeout=15, headers=headers)
         r.raise_for_status()
+
+        # Guard non-HTML payloads (PDF, images, downloads): feeding these to the
+        # HTML parser yields garbage, so report the type honestly instead.
+        raw_content_type = r.headers.get("Content-Type", "")
+        content_type = raw_content_type.split(";", 1)[0].strip().lower()
+        if content_type and "html" not in content_type and "xml" not in content_type:
+            return None, f"非网页内容（{content_type}），无法渲染正文"
+
+        # When the header omits a charset, requests defaults to ISO-8859-1 and
+        # mojibakes UTF-8 pages; sniff the real encoding from the bytes instead.
+        if "charset=" not in raw_content_type.lower():
+            r.encoding = r.apparent_encoding or r.encoding
+
         html = r.text
 
         try:
@@ -790,7 +844,9 @@ def fetch_article_text(url):
             except Exception:
                 # Last-resort fallback: return stripped raw HTML text.
                 clean = strip_html(html)
-                return clean[:10000] if clean else None
+                if clean:
+                    return truncate_article_text(clean), None
+                return None, "缺少 readability/bs4 依赖，且无法从 HTML 提取文本"
 
         noise_keywords = (
             'ad', 'ads', 'advert', 'banner', 'cookie', 'consent', 'footer',
@@ -860,8 +916,8 @@ def fetch_article_text(url):
 
             attrs = attr_blob(node)
             if attrs:
-                has_noise = any(keyword in attrs for keyword in noise_keywords)
-                has_positive = any(keyword in attrs for keyword in positive_keywords)
+                has_noise = attr_keyword_hit(attrs, noise_keywords)
+                has_positive = attr_keyword_hit(attrs, positive_keywords)
                 if has_noise and not has_positive:
                     return True
 
@@ -1008,9 +1064,26 @@ def fetch_article_text(url):
         rendered = '\n'.join(out).strip()
         if not rendered:
             rendered = strip_html(str(root))
-        return rendered[:10000] if rendered else None
-    except Exception:
-        return None
+        if rendered:
+            return truncate_article_text(rendered), None
+        return None, "抓到页面但未能提取正文（可能是 JS 渲染或付费墙）"
+    except requests.exceptions.Timeout:
+        return None, "请求超时（15 秒内无响应）"
+    except requests.exceptions.ConnectionError:
+        return None, "无法连接（网络或 DNS 问题）"
+    except requests.exceptions.HTTPError as e:
+        response = getattr(e, "response", None)
+        status = getattr(response, "status_code", None)
+        if status == 403:
+            return None, "HTTP 403：可能被反爬/防火墙拦截"
+        if status == 404:
+            return None, "HTTP 404：页面不存在"
+        if status is not None:
+            return None, f"HTTP {status}：服务器拒绝返回内容"
+        return None, f"HTTP 请求失败：{e}"
+    except Exception as e:
+        # Unexpected parse/runtime error — surface the type so it can be traced.
+        return None, f"抓取异常：{type(e).__name__}: {e}"
 
 class HNViewer:
     def __init__(self, stdscr):
@@ -1643,7 +1716,7 @@ class HNViewer:
         self.status = f"Fetching article: {s.title[:50]}..."
         self.draw_main()
         self.stdscr.refresh()
-        text = fetch_article_text(s.url)
+        text, error = fetch_article_text(s.url)
         if text:
             _, w = self.stdscr.getmaxyx()
             content_w = w - 4
@@ -1658,7 +1731,8 @@ class HNViewer:
             self.view_state = ViewState.ARTICLE
             self.status = self._article_status()
         else:
-            self.status = "Failed to fetch article content. Press l for comments instead."
+            reason = error or "未知原因"
+            self.status = f"打不开原文：{reason} | l 看评论"
         self.loading = False
         self._flush_pending_input()
 

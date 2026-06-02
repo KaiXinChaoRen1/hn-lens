@@ -16,6 +16,36 @@ from hnmod import load_hn_module
 mod = load_hn_module()
 
 
+class TruncateArticleTextTests(unittest.TestCase):
+    def test_short_text_unchanged(self):
+        self.assertEqual(mod.truncate_article_text("short body"), "short body")
+
+    def test_long_text_gets_truncation_marker(self):
+        out = mod.truncate_article_text("x" * (mod.ARTICLE_CHAR_LIMIT + 500))
+        self.assertTrue(out.endswith("已截断）"))
+        # Body is capped at the limit; only the short marker is added past it.
+        self.assertLessEqual(len(out), mod.ARTICLE_CHAR_LIMIT + 20)
+
+
+class AttrKeywordHitTests(unittest.TestCase):
+    noise = ("ad", "ads", "nav", "share", "related", "comment", "advert")
+
+    def test_short_keyword_needs_word_boundary(self):
+        # 'ad' must not match real content classes it merely sits inside.
+        for blob in ("article-header", "reading-content", "story-header",
+                     "thread", "headline", "breadcrumb"):
+            self.assertFalse(mod.attr_keyword_hit(blob, self.noise), blob)
+
+    def test_short_keyword_matches_whole_token(self):
+        self.assertTrue(mod.attr_keyword_hit("ad-slot", self.noise))
+        self.assertTrue(mod.attr_keyword_hit("main nav", self.noise))
+
+    def test_long_keyword_matches_as_substring(self):
+        self.assertTrue(mod.attr_keyword_hit("advertisement", self.noise))
+        self.assertTrue(mod.attr_keyword_hit("comments-section", self.noise))
+        self.assertTrue(mod.attr_keyword_hit("related-posts", self.noise))
+
+
 class SplitArticleBlocksTests(unittest.TestCase):
     def test_blank_lines_separate_blocks(self):
         lines = ["a", "b", "", "c", "", ""]
@@ -178,6 +208,7 @@ class FetchArticleTextTests(unittest.TestCase):
     def _patched_fetch(self, html, summary):
         class FakeResponse:
             text = html
+            headers = {"Content-Type": "text/html; charset=utf-8"}
 
             def raise_for_status(self):
                 return None
@@ -199,16 +230,51 @@ class FetchArticleTextTests(unittest.TestCase):
         html = f"<html><body><div><p>{desired}</p></div><div>{noisy}</div></body></html>"
         get_patch, mod_patch = self._patched_fetch(html, f"<div><p>{desired}</p></div>")
         with get_patch, mod_patch:
-            extracted = mod.fetch_article_text("https://example.com/article")
+            extracted, error = mod.fetch_article_text("https://example.com/article")
+        self.assertIsNone(error)
         self.assertIn("Important article sentence.", extracted)
         self.assertNotIn("FILLERMARKER", extracted)
 
-    def test_empty_url_returns_none(self):
-        self.assertIsNone(mod.fetch_article_text(""))
+    def test_empty_url_returns_reason(self):
+        text, error = mod.fetch_article_text("")
+        self.assertIsNone(text)
+        self.assertTrue(error)
 
-    def test_network_failure_returns_none(self):
+    def test_network_failure_returns_reason(self):
         with mock.patch.object(mod.requests, "get", side_effect=Exception("boom")):
-            self.assertIsNone(mod.fetch_article_text("https://example.com"))
+            text, error = mod.fetch_article_text("https://example.com")
+        self.assertIsNone(text)
+        self.assertIn("boom", error)
+
+    def test_missing_charset_triggers_encoding_sniff(self):
+        # No charset in the header -> requests would default to ISO-8859-1, so
+        # fetch should switch to the sniffed encoding before reading .text.
+        class FakeResponse:
+            headers = {"Content-Type": "text/html"}
+            apparent_encoding = "utf-8"
+            encoding = "ISO-8859-1"
+            text = "<html><body><p>a real sentence with substance here.</p></body></html>"
+
+            def raise_for_status(self):
+                return None
+
+        fake = FakeResponse()
+        with mock.patch.object(mod.requests, "get", return_value=fake):
+            mod.fetch_article_text("https://example.com")
+        self.assertEqual(fake.encoding, "utf-8")
+
+    def test_non_html_content_type_reports_reason(self):
+        class FakeResponse:
+            text = "%PDF-1.7 ..."
+            headers = {"Content-Type": "application/pdf"}
+
+            def raise_for_status(self):
+                return None
+
+        with mock.patch.object(mod.requests, "get", return_value=FakeResponse()):
+            text, error = mod.fetch_article_text("https://example.com/file.pdf")
+        self.assertIsNone(text)
+        self.assertIn("application/pdf", error)
 
 
 if __name__ == "__main__":
