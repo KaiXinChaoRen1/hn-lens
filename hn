@@ -1679,12 +1679,12 @@ class HNViewer:
 
         if self.loading:
             self.stdscr.addnstr(h // 2, w // 2 - 10, "Loading...", w - 1)
-            self.stdscr.refresh()
+            self.stdscr.noutrefresh()
             return
 
         if not self.stories:
             self.stdscr.addnstr(h // 2, w // 2 - 15, "No stories loaded. Press 'r' to retry.", w - 1)
-            self.stdscr.refresh()
+            self.stdscr.noutrefresh()
             return
 
         stories_to_show = self.filtered_stories if self.search_mode else self.stories
@@ -1760,7 +1760,7 @@ class HNViewer:
         status_line = f" {self.status} "
         self._draw_full_width_bar(h - 1, status_line, curses.color_pair(6))
 
-        self.stdscr.refresh()
+        self.stdscr.noutrefresh()
 
     def draw_article(self):
         self.stdscr.erase()
@@ -1768,7 +1768,7 @@ class HNViewer:
 
         if not self.article_text:
             self.stdscr.addnstr(h // 2, w // 2 - 15, "No article content available.", w - 1)
-            self.stdscr.refresh()
+            self.stdscr.noutrefresh()
             return
 
         # Title bar
@@ -1866,7 +1866,7 @@ class HNViewer:
         status_line = f" {self.status} "
         self._draw_full_width_bar(h - 1, status_line, curses.color_pair(6))
 
-        self.stdscr.refresh()
+        self.stdscr.noutrefresh()
 
     def _calc_comment_rows(self, w, h, start_idx):
         """Calculate how many screen rows a comment takes, starting from start_idx.
@@ -1913,7 +1913,7 @@ class HNViewer:
 
         if not self.comments:
             self.stdscr.addnstr(h // 2, w // 2 - 10, "No comments found.", w - 1)
-            self.stdscr.refresh()
+            self.stdscr.noutrefresh()
             return
 
         # Title bar
@@ -2022,7 +2022,7 @@ class HNViewer:
         status_line = f" {self.status} "
         self._draw_full_width_bar(h - 1, status_line, curses.color_pair(6))
 
-        self.stdscr.refresh()
+        self.stdscr.noutrefresh()
 
     def draw_translation_popup(self):
         """Draw translation overlay on top of current view"""
@@ -2100,7 +2100,7 @@ class HNViewer:
             self.stdscr.addnstr(start_y + box_h - 2, start_x + 2, footer, box_w - 4)
             self.stdscr.attroff(curses.color_pair(8))
 
-            self.stdscr.refresh()
+            self.stdscr.noutrefresh()
         except curses.error:
             pass
 
@@ -2139,7 +2139,7 @@ class HNViewer:
             self.stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
             self.stdscr.addnstr(y, x, msg, w - x - 1)
             self.stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-            self.stdscr.refresh()
+            self.stdscr.noutrefresh()
         except curses.error:
             pass
 
@@ -2229,6 +2229,11 @@ class HNViewer:
 
             if in_confirm:
                 self.draw_confirm_exit()
+
+            # Composite the background and any overlay into a single physical
+            # update. Without this, each draw_* would refresh on its own and the
+            # popup/spinner frame would flash the bare background underneath it.
+            curses.doupdate()
 
             key = self.stdscr.getch()
 

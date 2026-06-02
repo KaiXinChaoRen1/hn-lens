@@ -43,6 +43,9 @@ class DummyScreen:
     def refresh(self):
         return None
 
+    def noutrefresh(self):
+        return None
+
     def attron(self, *args, **kwargs):
         return None
 
