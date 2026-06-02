@@ -154,25 +154,65 @@ class HNViewerTests(unittest.TestCase):
         self.assertEqual(viewer.trans_result, "translated")
         self.assertEqual(viewer.cache[cache_key], "translated")
 
-    def test_full_article_translation_is_cached(self):
+    def test_translation_pane_defaults_closed(self):
         viewer = self.make_viewer()
-        paragraphs = [{"pid": "P1", "text": "hello article"}]
-        prompt = self.mod.build_article_translation_prompt(paragraphs)
-        cache_key = self.mod.get_cache_key(f"article-v2:{prompt}")
+        self.assertFalse(viewer.article_pane_open)
 
-        with mock.patch.object(self.mod, "call_llm", return_value="[P1]\nwhole article translated"), mock.patch.object(
+    def test_pane_translation_shares_cache_key_with_popup(self):
+        # The pane and the `T` popup must hit the same cache entry so a
+        # paragraph translated one way shows up instantly the other way.
+        viewer = self.make_viewer()
+        viewer.article_paragraphs = [{"pid": "P1", "text": "hello article"}]
+        viewer.article_selected = 0
+        self.assertEqual(
+            viewer._selected_paragraph_key(),
+            self.mod.get_cache_key("hello article"),
+        )
+
+    def test_open_pane_translates_selected_paragraph_and_caches(self):
+        viewer = self.make_viewer()
+        viewer.article_pane_open = True
+        viewer.article_paragraphs = [{"pid": "P1", "text": "hello article"}]
+        viewer.article_selected = 0
+        key = self.mod.get_cache_key("hello article")
+
+        with mock.patch.object(self.mod, "call_llm", return_value="译文"), mock.patch.object(
             self.mod.threading, "Thread", ImmediateThread
         ):
-            viewer.start_article_translation(paragraphs)
+            viewer._ensure_selected_paragraph_translation()
 
-        self.assertEqual(viewer.article_translation_text, "[P1]\nwhole article translated")
-        self.assertEqual(viewer.article_translation_map["P1"], "whole article translated")
-        self.assertEqual(viewer.cache[cache_key], "[P1]\nwhole article translated")
+        self.assertEqual(viewer.cache[key], "译文")
+        self.assertNotIn(key, viewer.article_pane_inflight)
+        self.assertEqual(viewer._build_selected_article_translation_lines(60), ["译文"])
 
-    def test_parse_labeled_article_translation(self):
-        parsed = self.mod.parse_labeled_article_translation("[P1]\n第一段\n\n[P2]\n第二段")
-        self.assertEqual(parsed["P1"], "第一段")
-        self.assertEqual(parsed["P2"], "第二段")
+    def test_closed_pane_does_not_translate(self):
+        viewer = self.make_viewer()
+        viewer.article_pane_open = False
+        viewer.article_paragraphs = [{"pid": "P1", "text": "hello article"}]
+        viewer.article_selected = 0
+
+        with mock.patch.object(self.mod, "call_llm") as llm, mock.patch.object(
+            self.mod.threading, "Thread", ImmediateThread
+        ):
+            viewer._ensure_selected_paragraph_translation()
+
+        llm.assert_not_called()
+
+    def test_pane_translation_error_is_surfaced_but_not_cached(self):
+        viewer = self.make_viewer()
+        viewer.article_pane_open = True
+        viewer.article_paragraphs = [{"pid": "P1", "text": "hello article"}]
+        viewer.article_selected = 0
+        key = self.mod.get_cache_key("hello article")
+
+        with mock.patch.object(self.mod, "call_llm", return_value="[错误] timeout"), mock.patch.object(
+            self.mod.threading, "Thread", ImmediateThread
+        ):
+            viewer._ensure_selected_paragraph_translation()
+
+        self.assertNotIn(key, viewer.cache)
+        self.assertEqual(viewer.article_pane_errors[key], "[错误] timeout")
+        self.assertEqual(viewer._build_selected_article_translation_lines(60)[0], "[错误] timeout")
 
     def test_article_extraction_prefers_summary_over_full_body_noise(self):
         desired = "Important article sentence. " * 12
@@ -291,28 +331,6 @@ class HNViewerTests(unittest.TestCase):
 
         self.assertIn("API 请求失败 (400)", result)
         self.assertIn("context length exceeded", result)
-
-    def test_article_translation_lines_show_specific_error_text(self):
-        viewer = self.make_viewer()
-        viewer.article_paragraphs = [{"pid": "P1", "text": "hello"}]
-        viewer.article_selected = 0
-        viewer.article_translation_text = "[错误] 请求超时：大模型在 30 秒内没有返回结果"
-
-        lines = viewer._build_selected_article_translation_lines(60)
-
-        self.assertEqual(lines[0], "[错误] 请求超时：大模型在 30 秒内没有返回结果")
-
-    def test_article_translation_lines_explain_missing_segment_label(self):
-        viewer = self.make_viewer()
-        viewer.article_paragraphs = [{"pid": "P2", "text": "hello"}]
-        viewer.article_selected = 0
-        viewer.article_translation_text = "[P1]\n第一段"
-        viewer.article_translation_map = {"P1": "第一段"}
-
-        lines = viewer._build_selected_article_translation_lines(60)
-
-        self.assertEqual(lines[0], "[P2]")
-        self.assertIn("没有找到这一段的编号", lines[1])
 
 
 if __name__ == "__main__":

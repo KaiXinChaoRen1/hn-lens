@@ -159,34 +159,6 @@ class ParagraphLabelingTests(unittest.TestCase):
         self.assertTrue(lines[-1].strip())
 
 
-class TranslationPromptTests(unittest.TestCase):
-    def test_prompt_includes_each_paragraph_id_and_text(self):
-        paras = [{"pid": "P1", "text": "hello"}, {"pid": "P2", "text": "world"}]
-        prompt = mod.build_article_translation_prompt(paras)
-        self.assertIn("[P1]\nhello", prompt)
-        self.assertIn("[P2]\nworld", prompt)
-
-    def test_batches_respect_char_budget_and_preserve_order(self):
-        paras = [{"pid": f"P{i}", "text": "x" * 1000} for i in range(1, 7)]
-        batches = mod.split_article_translation_batches(paras, max_chars=2500)
-        self.assertGreater(len(batches), 1)
-        flattened = [p["pid"] for batch in batches for p in batch]
-        self.assertEqual(flattened, [p["pid"] for p in paras])
-
-    def test_single_oversized_paragraph_still_forms_a_batch(self):
-        paras = [{"pid": "P1", "text": "x" * 5000}]
-        batches = mod.split_article_translation_batches(paras, max_chars=100)
-        self.assertEqual(len(batches), 1)
-
-    def test_parse_labeled_translation_roundtrip(self):
-        parsed = mod.parse_labeled_article_translation("[P1]\n第一段\n\n[P2]\n第二段")
-        self.assertEqual(parsed, {"P1": "第一段", "P2": "第二段"})
-
-    def test_parse_ignores_preamble_before_first_label(self):
-        parsed = mod.parse_labeled_article_translation("Sure!\n[P1]\n译文")
-        self.assertEqual(parsed, {"P1": "译文"})
-
-
 class ScrollAdjustmentTests(unittest.TestCase):
     def test_short_paragraph_scrolls_fully_into_view(self):
         self.assertEqual(
