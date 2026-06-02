@@ -252,6 +252,10 @@ class HNViewerTests(unittest.TestCase):
         self.assertGreater(len(wrapped), 1)
         self.assertTrue(all(self.mod.get_display_width(part) <= 10 for part in wrapped))
 
+    def test_time_ago_clamps_future_timestamps(self):
+        future = self.mod.time.time() + 120
+        self.assertEqual(self.mod.time_ago(int(future)), "0s ago")
+
     def test_strip_html_decodes_html_entities_in_urls(self):
         text = "https:&#x2F;&#x2F;github.com&#x2F;openclaw"
         self.assertEqual(self.mod.strip_html(text), "https://github.com/openclaw")

@@ -190,7 +190,7 @@ def load_cache():
         try:
             with open(CACHE_FILE, "r") as f:
                 return json.load(f)
-        except:
+        except Exception:
             pass
     return {}
 
@@ -201,7 +201,7 @@ def save_cache(cache):
             os.makedirs(CONFIG_DIR)
         with open(CACHE_FILE, "w") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
-    except:
+    except Exception:
         pass
 
 def load_stories_cache() -> Dict[str, Any]:
@@ -210,7 +210,7 @@ def load_stories_cache() -> Dict[str, Any]:
         try:
             with open(STORIES_CACHE_FILE, "r") as f:
                 return json.load(f)
-        except:
+        except Exception:
             pass
     return {}
 
@@ -221,7 +221,7 @@ def save_stories_cache(cache: Dict[str, Any]):
             os.makedirs(CONFIG_DIR)
         with open(STORIES_CACHE_FILE, "w") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
-    except:
+    except Exception:
         pass
 
 def get_cache_key(text: str) -> str:
@@ -418,7 +418,8 @@ def flatten_comments(item, depth=0, result=None) -> List[Comment]:
     return result
 
 def time_ago(ts):
-    diff = int(time.time()) - ts
+    # Clamp clock-skew / future timestamps so we never render "-120s ago".
+    diff = max(0, int(time.time()) - ts)
     if diff < 60:
         return f"{diff}s ago"
     elif diff < 3600:
